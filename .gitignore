@@ -9,6 +9,11 @@ result
 *.csr
 extfile.conf
 
+# Claude Code (keep CLAUDE.md + settings.json committed, ignore internal data)
+.claude/settings.local.json
+.claude/plans/sessions/
+.claude/headless-output/
+
 # flatpak files
 .flatpak-builder
 repo

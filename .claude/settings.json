@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$PROJECT_DIR\" && (rustfmt \"$FILE_PATH\" 2>/dev/null || true)",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
