@@ -1,20 +1,22 @@
-use env_logger::Env;
-use input_capture::InputCaptureError;
-use input_emulation::InputEmulationError;
 use dualink::{
     capture_test,
     config::{self, Command, Config, ConfigError},
     emulation_test,
     service::{Service, ServiceError},
 };
+use env_logger::Env;
+use input_capture::InputCaptureError;
+use input_emulation::InputEmulationError;
 use lan_mouse_cli::CliError;
 #[cfg(feature = "gtk")]
 use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
+#[cfg(feature = "gtk")]
+use std::process::Child;
 use std::{
     future::Future,
     io,
-    process::{self, Child},
+    process::{self},
 };
 use thiserror::Error;
 use tokio::task::LocalSet;
@@ -53,6 +55,13 @@ fn main() {
 
 fn run() -> Result<(), DualinkError> {
     let config = config::Config::new()?;
+
+    // --diagnose: print full system report and exit
+    if config.diagnose() {
+        dualink::diagnostics::print_full_report(config.port());
+        return Ok(());
+    }
+
     match config.command() {
         Some(command) => match command {
             Command::TestEmulation(args) => run_async(emulation_test::run(config, args))?,
@@ -118,6 +127,7 @@ where
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
 }
 
+#[cfg(feature = "gtk")]
 fn start_service() -> Result<Child, io::Error> {
     let child = process::Command::new(std::env::current_exe()?)
         .args(std::env::args().skip(1))
@@ -127,6 +137,9 @@ fn start_service() -> Result<Child, io::Error> {
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {
+    // Run startup diagnostics (logs warnings for any issues)
+    dualink::diagnostics::log_startup_checks();
+
     let release_bind = config.release_bind();
     let config_path = config.config_path().to_owned();
     let mut service = Service::new(config).await?;

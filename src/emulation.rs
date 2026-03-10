@@ -217,7 +217,10 @@ enum ProxyRequest {
 }
 
 impl EmulationProxy {
-    fn new(backend: Option<input_emulation::Backend>, key_remap: std::collections::HashMap<u32, u32>) -> Self {
+    fn new(
+        backend: Option<input_emulation::Backend>,
+        key_remap: std::collections::HashMap<u32, u32>,
+    ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_active = Rc::new(Cell::new(false));

@@ -101,6 +101,7 @@ async fn handle_clipboard_peer(
     event_tx: mpsc::Sender<ClipboardSyncEvent>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
+    #[allow(clippy::while_let_loop)]
     loop {
         // Read length-prefixed JSON messages
         let len = match stream.read_u32().await {
@@ -138,9 +139,7 @@ async fn handle_clipboard_peer(
             } => {
                 if let Ok(text) = String::from_utf8(data) {
                     log::debug!("received clipboard text from {addr}: {} bytes", text.len());
-                    let _ = event_tx
-                        .send(ClipboardSyncEvent::RemoteData { text })
-                        .await;
+                    let _ = event_tx.send(ClipboardSyncEvent::RemoteData { text }).await;
                 }
             }
             ClipboardMessage::Request { format } => {

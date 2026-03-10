@@ -74,7 +74,7 @@ impl ClipboardProvider for WindowsClipboard {
                 CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
             };
             use windows::Win32::System::Memory::{
-                GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+                GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
             };
             use windows::Win32::System::Ole::CF_UNICODETEXT;
 
@@ -92,7 +92,8 @@ impl ClipboardProvider for WindowsClipboard {
                     if !ptr.is_null() {
                         std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
                         GlobalUnlock(hmem);
-                        let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, std::mem::transmute(hmem));
+                        let _ =
+                            SetClipboardData(CF_UNICODETEXT.0 as u32, std::mem::transmute(hmem));
                     }
                 }
                 let _ = CloseClipboard();

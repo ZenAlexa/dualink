@@ -208,8 +208,7 @@ impl Emulation for VirtualHIDEmulation {
                             Some(l) => l,
                             None => return Ok(()),
                         };
-                        let (new_x, new_y) =
-                            clamp_to_screen_space(location.x, location.y, dx, dy);
+                        let (new_x, new_y) = clamp_to_screen_space(location.x, location.y, dx, dy);
                         let mouse_location = CGPoint::new(new_x, new_y);
                         let event_type = self
                             .pressed_buttons
@@ -234,11 +233,7 @@ impl Emulation for VirtualHIDEmulation {
                             event.post(CGEventTapLocation::HID);
                         }
                     }
-                    PointerEvent::Button {
-                        button,
-                        state,
-                        ..
-                    } => {
+                    PointerEvent::Button { button, state, .. } => {
                         let cg_button_number: Option<i64> = match button {
                             BTN_BACK => Some(3),
                             BTN_FORWARD => Some(4),
@@ -247,16 +242,10 @@ impl Emulation for VirtualHIDEmulation {
                         let (event_type, mouse_button) = match (button, state) {
                             (BTN_LEFT, 1) => (CGEventType::LeftMouseDown, CGMouseButton::Left),
                             (BTN_LEFT, 0) => (CGEventType::LeftMouseUp, CGMouseButton::Left),
-                            (BTN_RIGHT, 1) => {
-                                (CGEventType::RightMouseDown, CGMouseButton::Right)
-                            }
+                            (BTN_RIGHT, 1) => (CGEventType::RightMouseDown, CGMouseButton::Right),
                             (BTN_RIGHT, 0) => (CGEventType::RightMouseUp, CGMouseButton::Right),
-                            (BTN_MIDDLE, 1) => {
-                                (CGEventType::OtherMouseDown, CGMouseButton::Center)
-                            }
-                            (BTN_MIDDLE, 0) => {
-                                (CGEventType::OtherMouseUp, CGMouseButton::Center)
-                            }
+                            (BTN_MIDDLE, 1) => (CGEventType::OtherMouseDown, CGMouseButton::Center),
+                            (BTN_MIDDLE, 0) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
                             (BTN_BACK, 1) | (BTN_FORWARD, 1) => {
                                 (CGEventType::OtherMouseDown, CGMouseButton::Center)
                             }
@@ -274,12 +263,9 @@ impl Emulation for VirtualHIDEmulation {
 
                         if state == 1 {
                             if self.previous_button == Some(button)
-                                && self
-                                    .previous_button_click
-                                    .is_some_and(|i| {
-                                        i.elapsed()
-                                            < std::time::Duration::from_millis(500)
-                                    })
+                                && self.previous_button_click.is_some_and(|i| {
+                                    i.elapsed() < std::time::Duration::from_millis(500)
+                                })
                             {
                                 self.button_click_state += 1;
                             } else {

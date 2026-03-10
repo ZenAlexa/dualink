@@ -99,6 +99,10 @@ struct Args {
     #[arg(long)]
     cert_path: Option<PathBuf>,
 
+    /// print system compatibility report and exit
+    #[arg(long)]
+    diagnose: bool,
+
     /// subcommands
     #[command(subcommand)]
     command: Option<Command>,
@@ -358,6 +362,11 @@ impl Config {
         })
     }
 
+    /// whether `--diagnose` was passed
+    pub fn diagnose(&self) -> bool {
+        self.args.diagnose
+    }
+
     /// the command to run
     pub fn command(&self) -> Option<Command> {
         self.args.command.clone()
@@ -423,8 +432,7 @@ impl Config {
                 map.iter()
                     .filter_map(|(from, to)| {
                         let from_key: scancode::Linux =
-                            serde_json::from_value(serde_json::Value::String(from.clone()))
-                                .ok()?;
+                            serde_json::from_value(serde_json::Value::String(from.clone())).ok()?;
                         let to_key: scancode::Linux =
                             serde_json::from_value(serde_json::Value::String(to.clone())).ok()?;
                         Some((from_key as u32, to_key as u32))

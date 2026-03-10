@@ -330,7 +330,7 @@ async fn create(
                 log::info!("using capture backend: {backend}");
                 return Ok(b);
             }
-            Err(e) if e.cancelled_by_user() => return Err(e),
+            Err(e) if e.cancelled_by_user() || e.is_permission_error() => return Err(e),
             Err(e) => log::warn!("{backend} input capture backend unavailable: {e}"),
         }
     }

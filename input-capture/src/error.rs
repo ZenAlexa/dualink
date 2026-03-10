@@ -93,6 +93,19 @@ impl CaptureCreationError {
     pub(crate) fn cancelled_by_user(&self) -> bool {
         false
     }
+
+    /// Error is a system permission issue that cannot be resolved by
+    /// trying a different backend — should not fall through to the next one.
+    pub(crate) fn is_permission_error(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            self,
+            CaptureCreationError::MacOS(MacosCaptureCreationError::AccessibilityNotTrusted)
+        ) {
+            return true;
+        }
+        false
+    }
 }
 
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
@@ -154,4 +167,9 @@ pub enum MacosCaptureCreationError {
     #[cfg(target_os = "macos")]
     #[error("failed to get display ids: {0}")]
     ActiveDisplays(CGError),
+    #[error(
+        "accessibility permission not granted — \
+         open System Settings → Privacy & Security → Accessibility and add dualink"
+    )]
+    AccessibilityNotTrusted,
 }

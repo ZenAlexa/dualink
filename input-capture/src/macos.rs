@@ -2,7 +2,7 @@ use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCr
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
-    base::{CFRelease, kCFAllocatorDefault},
+    base::{CFRelease, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
     number::{CFBooleanRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
@@ -28,7 +28,10 @@ use std::{
     collections::HashSet,
     ffi::{CString, c_char},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicPtr, Ordering},
+    },
     task::{Context, Poll, ready},
     thread::{self},
     time::{Duration, Instant},
@@ -400,6 +403,18 @@ fn create_event_tap<'a>(
     notify_tx: Sender<ProducerEvent>,
     event_tx: Sender<(Position, CaptureEvent)>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
+    // Check accessibility permission before creating the event tap.
+    // Without it, CGEventTap::new will silently fail or the tap will be
+    // immediately disabled by the system.
+    if !is_accessibility_trusted() {
+        return Err(MacosCaptureCreationError::AccessibilityNotTrusted);
+    }
+
+    // Shared mach port pointer so the callback can re-enable the tap on timeout.
+    // Populated after tap creation; the callback checks for null.
+    let tap_mach_port: Arc<AtomicPtr<c_void>> = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
+    let tap_port_for_callback = tap_mach_port.clone();
+
     let cg_events_of_interest: Vec<CGEventType> = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
@@ -420,21 +435,55 @@ fn create_event_tap<'a>(
     let event_tap_callback =
         move |_proxy: CGEventTapProxy, event_type: CGEventType, cg_ev: &CGEvent| {
             log::trace!("Got event from tap: {event_type:?}");
-            let mut state = client_state.blocking_lock();
-            let mut capture_position = None;
-            let mut res_events = vec![];
 
-            if matches!(
-                event_type,
-                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
-            ) {
-                log::error!("CGEventTap disabled");
+            // Handle tap disable events BEFORE acquiring the lock.
+            // These handlers only need the AtomicPtr / notify channel,
+            // not the InputCaptureState.  Acquiring the mutex first would
+            // risk stalling the callback long enough to cause the very
+            // timeout we are trying to recover from.
+            if matches!(event_type, CGEventType::TapDisabledByTimeout) {
+                let port = tap_port_for_callback.load(Ordering::Acquire);
+                if !port.is_null() {
+                    unsafe {
+                        CGEventTapEnable(port, true);
+                    }
+                    log::warn!("CGEventTap was disabled by timeout — re-enabled");
+                } else {
+                    // Theoretically unreachable: the store happens before
+                    // CFRunLoop::run_current().  Trigger a full restart as
+                    // a defensive measure rather than leaving the tap dead.
+                    log::error!(
+                        "CGEventTap disabled by timeout but mach port unavailable — \
+                         requesting capture restart"
+                    );
+                    notify_tx
+                        .blocking_send(ProducerEvent::EventTapDisabled)
+                        .unwrap_or_else(|e| {
+                            log::error!("Failed to send notification: {e}");
+                        });
+                    CFRunLoop::get_current().stop();
+                }
+                return CallbackResult::Keep;
+            }
+
+            if matches!(event_type, CGEventType::TapDisabledByUserInput) {
+                log::error!(
+                    "CGEventTap disabled by system — \
+                     accessibility permission may have been revoked"
+                );
                 notify_tx
                     .blocking_send(ProducerEvent::EventTapDisabled)
                     .unwrap_or_else(|e| {
                         log::error!("Failed to send notification: {e}");
                     });
+                // Stop the CFRunLoop to trigger clean capture shutdown
+                CFRunLoop::get_current().stop();
+                return CallbackResult::Keep;
             }
+
+            let mut state = client_state.blocking_lock();
+            let mut capture_position = None;
+            let mut res_events = vec![];
 
             // Are we in a client?
             if let Some(current_pos) = state.current_pos {
@@ -497,8 +546,14 @@ fn create_event_tap<'a>(
     )
     .map_err(|_| MacosCaptureCreationError::EventTapCreation)?;
 
-    let tap_source: CFRunLoopSource = tap
-        .mach_port()
+    // Store the mach port reference so the callback can re-enable on timeout.
+    let mach_port = tap.mach_port();
+    tap_mach_port.store(
+        mach_port.as_concrete_TypeRef() as *const _ as *mut c_void,
+        Ordering::Release,
+    );
+
+    let tap_source: CFRunLoopSource = mach_port
         .create_runloop_source(0)
         .expect("Failed creating loop source");
 
@@ -659,6 +714,7 @@ extern "C" {
         value: CFBooleanRef,
     ) -> CGError;
     fn _CGSDefaultConnection() -> CGSConnectionID;
+    fn AXIsProcessTrusted() -> u8;
 }
 
 extern "C" {
@@ -666,6 +722,12 @@ extern "C" {
         event_source: CGEventSource,
         seconds: CFTimeInterval,
     );
+    fn CGEventTapEnable(tap: *const c_void, enable: bool);
+}
+
+/// Check if the current process has accessibility permission (TCC).
+fn is_accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
 }
 
 unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {

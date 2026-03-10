@@ -39,11 +39,7 @@ impl ClipboardProvider for MacOSClipboard {
         let output = Command::new("pbpaste").output().ok()?;
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+            if text.is_empty() { None } else { Some(text) }
         } else {
             None
         }
@@ -51,7 +47,10 @@ impl ClipboardProvider for MacOSClipboard {
 
     fn set_text(&self, text: &str) {
         use std::io::Write;
-        let mut child = match Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn() {
+        let mut child = match Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
             Ok(c) => c,
             Err(e) => {
                 log::warn!("failed to spawn pbcopy: {e}");

@@ -6,6 +6,7 @@ pub mod clipboard_sync;
 pub mod config;
 mod connect;
 mod crypto;
+pub mod diagnostics;
 mod dns;
 mod emulation;
 pub mod emulation_test;
