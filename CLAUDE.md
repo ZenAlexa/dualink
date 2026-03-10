@@ -18,6 +18,12 @@ Platforms: macOS (CGEventTap/CGEventPost), Linux (libei/wlroots), Windows (SendI
 - `lan-mouse-ipc/` — IPC between daemon and frontends (Unix socket: `dualink.sock`)
 - `src/clipboard/` + `src/clipboard_sync.rs` — clipboard sync over TCP (port 4243)
 
+## Reference Repos
+
+- `_reference/` — local clones of competitor KVM projects (gitignored)
+- `./scripts/ref-sync.sh` — clone or update all reference repos
+- Repos: deskflow, input-leap, barrier, lan-mouse (upstream)
+
 ## Build & Dev Commands
 
 ```sh

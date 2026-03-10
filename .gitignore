@@ -14,6 +14,9 @@ extfile.conf
 .claude/plans/sessions/
 .claude/headless-output/
 
+# Reference repos (local clones for analysis)
+_reference/
+
 # flatpak files
 .flatpak-builder
 repo
