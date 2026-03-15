@@ -2,7 +2,7 @@ use crate::keymap::{KeyRemapConfig, KeyRemapEngine};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, MouseConfig};
-use input_event::Event;
+use input_event::{Event, KeyboardEvent};
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
@@ -346,7 +346,7 @@ impl EmulationTask {
         let mut emulation = tokio::select! {
             r = InputEmulation::new(self.backend) => r?,
             // allow termination event while requesting input emulation
-            _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+            _ = wait_for_termination(&mut self.request_rx, &mut self.key_remap) => return Ok(()),
         };
 
         // create modifier-aware key remap engine
@@ -389,7 +389,7 @@ impl EmulationTask {
         for handle in self.handles.values() {
             tokio::select! {
                 _ = emulation.create(*handle) => {},
-                _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
+                _ = wait_for_termination(&mut self.request_rx, &mut self.key_remap) => return Ok(()),
             }
         }
         Ok(())
@@ -429,6 +429,21 @@ impl EmulationTask {
                         }
                     }
                     ProxyRequest::UpdateKeyRemap(new_config) => {
+                        // Release pressed modifiers using OLD mapping to prevent
+                        // stuck keys when remapping changes while a key is held.
+                        let stuck = key_remap.drain_pressed();
+                        if !stuck.is_empty() {
+                            if let Some(&handle) = self.handles.values().next() {
+                                for (_, remapped_key) in stuck {
+                                    let release = Event::Keyboard(KeyboardEvent::Key {
+                                        time: 0,
+                                        key: remapped_key,
+                                        state: 0,
+                                    });
+                                    let _ = emulation.consume(release, handle).await;
+                                }
+                            }
+                        }
                         let count = new_config.mapping_count();
                         self.key_remap = new_config;
                         *key_remap = KeyRemapEngine::new(&self.key_remap);
@@ -455,14 +470,16 @@ fn to_ipc_pos(pos: Position) -> lan_mouse_ipc::Position {
     }
 }
 
-async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
+async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>, key_remap: &mut KeyRemapConfig) {
     loop {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
+            ProxyRequest::UpdateKeyRemap(config) => {
+                *key_remap = config;
+            }
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
-            ProxyRequest::UpdateKeyRemap(_) => continue,
         }
     }
 }

@@ -224,6 +224,13 @@ impl KeyRemapEngine {
         self.pressed_modifiers.clear();
     }
 
+    /// Drain all pressed modifier tracking state.
+    /// Returns (physical_key, remapped_key) pairs for synthesizing releases
+    /// before rebuilding the engine (e.g., on hot-reload).
+    pub fn drain_pressed(&mut self) -> Vec<(u32, u32)> {
+        self.pressed_modifiers.drain().collect()
+    }
+
     /// Remap a single event, updating internal modifier state.
     pub fn remap_event(&mut self, event: Event) -> Event {
         match event {

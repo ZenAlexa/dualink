@@ -479,7 +479,10 @@ impl Emulation for VirtualHIDEmulation {
                             self.previous_button_click = Some(std::time::Instant::now());
                         }
 
-                        let location = self.get_mouse_location().unwrap();
+                        let Some(location) = self.get_mouse_location() else {
+                            log::warn!("could not get mouse location for button event");
+                            return Ok(());
+                        };
                         if let Ok(event) = CGEvent::new_mouse_event(
                             self.event_source.clone(),
                             event_type,

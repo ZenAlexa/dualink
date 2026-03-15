@@ -7,7 +7,7 @@
 | Competitive Analysis | COMPLETED | findings.md written |
 | Phase 1: Tahoe Resilience | DONE | CGEventTap hardening, accessibility check, diagnostics |
 | Phase 2: Mouse Quality | DONE | Event coalescing, mouse/scroll speed, natural scrolling, batch protocol, diagnostics |
-| Phase 3: Key Remapping | DONE | Session 3.1: modifier-aware remapping; Session 3.2: hot-reload + IPC; Session 3.3: special key handling |
+| Phase 3: Key Remapping | DONE + REVIEWED | Session 3.1: modifier-aware remapping; Session 3.2: hot-reload + IPC; Session 3.3: special key handling; cross-review: 3 fixes applied |
 | Phase 4: Clipboard | NOT STARTED | — |
 | Phase 5: Polish | NOT STARTED | — |
 
@@ -329,3 +329,57 @@ None.
 
 ### Next Session
 Begin Phase 4: Clipboard Enhancement (Session 4.1: Image Clipboard)
+
+---
+
+## Session: 2026-03-15 — Phase 3 Cross-Review Audit
+
+### What Happened
+Phase-level quality gate cross-review of all Phase 3 changes (9c3bc3a..ed38e11, 1911 insertions across 12 files).
+
+### Review Sources
+1. **Code Reviewer Agent (opus)**: Comprehensive review — 0 critical, 5 warnings, 6 info
+2. **GemSuite MCP (gemini_reason)**: Algorithm verification — bitmask remapping circular swap correctness confirmed across all 5 scenarios
+
+### Findings & Fixes
+
+#### [FIXED] WARNING: `unwrap()` on `get_mouse_location()` can panic
+- **Files**: `input-emulation/src/macos.rs:507`, `input-emulation/src/macos_vhid.rs:482`
+- **Issue**: Button event handler used `.unwrap()` on `get_mouse_location()`, which can return `None` if CGEvent source is in bad state. Contrasts with correct `match`/`let-else` patterns used elsewhere in the same files.
+- **Fix**: Replaced with `let Some(location) = ... else { return Ok(()); }` pattern.
+
+#### [FIXED] WARNING: Pressed modifier state lost on hot-reload
+- **Files**: `src/keymap.rs` (new `drain_pressed()`), `src/emulation.rs:431-446`
+- **Issue**: When `UpdateKeyRemap` rebuilds the engine, `pressed_modifiers` was cleared without synthesizing release events. If a user held Ctrl (mapped to Meta) during hot-reload that changed Ctrl→Alt, the release would emit Alt instead of Meta — leaving Meta stuck.
+- **Fix**: Added `KeyRemapEngine::drain_pressed()` method. UpdateKeyRemap handler now drains old pressed state and synthesizes release events using OLD mapping before rebuilding.
+
+#### [FIXED] WARNING: `wait_for_termination` silently drops `UpdateKeyRemap`
+- **Files**: `src/emulation.rs:473-484` (signature change), two call sites updated
+- **Issue**: During emulation backend initialization, `UpdateKeyRemap` messages were silently discarded. If IPC `SetKeyRemap` arrived during startup, the config was lost.
+- **Fix**: Changed `wait_for_termination` to accept `&mut KeyRemapConfig` parameter and store incoming config updates.
+
+#### [NOTED] WARNING: Debounce race between save_config and external edits
+- **File**: `src/service.rs:334,647`
+- **Issue**: 250ms debounce window after `save_config()` can suppress a coincident external edit.
+- **Status**: Acknowledged, deferred. Edge case too narrow to warrant added complexity (boolean flag or content hashing). External edit will be picked up on next watcher event.
+
+#### [NOTED] WARNING: `merge_cli_remap_strings` classification ambiguity
+- **File**: `src/config.rs:603-606`
+- **Issue**: If only one side of a `--remap` entry parses as a modifier role, it falls through to key remap and logs a confusing "unknown key name" error.
+- **Status**: Acknowledged, deferred. Behavior is correct, only error message path is suboptimal.
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (23 tests)
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `input-emulation/src/macos.rs` | Replaced `unwrap()` with graceful `let-else` on `get_mouse_location()` in Button handler |
+| `input-emulation/src/macos_vhid.rs` | Same `unwrap()` fix in Button handler |
+| `src/keymap.rs` | Added `drain_pressed()` method to `KeyRemapEngine` |
+| `src/emulation.rs` | Added `KeyboardEvent` import; UpdateKeyRemap handler drains+releases old pressed state; `wait_for_termination` stores UpdateKeyRemap instead of discarding |
+| `.claude/plans/.../progress.md` | This entry |
