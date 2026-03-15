@@ -1,6 +1,6 @@
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
-use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
+use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, MouseConfig};
 use input_event::Event;
 use lan_mouse_proto::{Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -66,8 +66,9 @@ impl Emulation {
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
         key_remap: std::collections::HashMap<u32, u32>,
+        mouse_config: MouseConfig,
     ) -> Self {
-        let emulation_proxy = EmulationProxy::new(backend, key_remap);
+        let emulation_proxy = EmulationProxy::new(backend, key_remap, mouse_config);
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let emulation_task = ListenTask {
@@ -220,6 +221,7 @@ impl EmulationProxy {
     fn new(
         backend: Option<input_emulation::Backend>,
         key_remap: std::collections::HashMap<u32, u32>,
+        mouse_config: MouseConfig,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -228,6 +230,7 @@ impl EmulationProxy {
         let emulation_task = EmulationTask {
             backend,
             key_remap,
+            mouse_config,
             exit_requested: exit_requested.clone(),
             request_rx,
             event_tx,
@@ -288,6 +291,7 @@ impl EmulationProxy {
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
     key_remap: std::collections::HashMap<u32, u32>,
+    mouse_config: MouseConfig,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
     event_tx: Sender<EmulationEvent>,
@@ -329,6 +333,9 @@ impl EmulationTask {
             log::info!("key remapping active: {} mappings", self.key_remap.len());
             emulation.set_key_remap(self.key_remap.clone());
         }
+
+        // apply mouse and scroll configuration
+        emulation.set_mouse_config(self.mouse_config.clone());
 
         // used to send enabled and disabled events
         let _emulation_guard = DropGuard::new(

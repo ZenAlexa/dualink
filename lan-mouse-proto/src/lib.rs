@@ -280,3 +280,129 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+// --- Batch encoding for multiple events per UDP packet ---
+
+/// Magic byte identifying a batch packet.  No valid `EventType` uses 0xFF.
+const BATCH_MAGIC: u8 = 0xFF;
+
+/// Maximum batch buffer size — fits within a typical 1500-byte MTU with
+/// headroom for UDP/IP/DTLS headers.
+pub const MAX_BATCH_SIZE: usize = 1200;
+
+/// Encode multiple events into a single batch buffer.
+///
+/// Wire format: `[0xFF][count:u8]([len:u8][event_data...])*`
+///
+/// Panics if `events` is empty or has more than 254 entries.
+/// Silently stops adding events once `MAX_BATCH_SIZE` would be exceeded.
+pub fn encode_batch(events: &[ProtoEvent]) -> Vec<u8> {
+    assert!(!events.is_empty() && events.len() <= 254);
+
+    let mut buf = Vec::with_capacity(2 + events.len() * MAX_EVENT_SIZE);
+    buf.push(BATCH_MAGIC);
+    // Placeholder for count — updated after loop.
+    buf.push(0);
+
+    let mut count: u8 = 0;
+    for &event in events {
+        let (data, len) = <([u8; MAX_EVENT_SIZE], usize)>::from(event);
+        // 1 byte for length prefix + event payload
+        if buf.len() + 1 + len > MAX_BATCH_SIZE {
+            break;
+        }
+        buf.push(len as u8);
+        buf.extend_from_slice(&data[..len]);
+        count += 1;
+    }
+    buf[1] = count;
+    buf
+}
+
+/// Decode a received packet, handling both legacy single-event packets
+/// and batch packets transparently.
+pub fn decode_packet(data: &[u8]) -> Result<Vec<ProtoEvent>, ProtocolError> {
+    if data.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Legacy single-event packet
+    if data[0] != BATCH_MAGIC {
+        let mut fixed = [0u8; MAX_EVENT_SIZE];
+        let copy_len = data.len().min(MAX_EVENT_SIZE);
+        fixed[..copy_len].copy_from_slice(&data[..copy_len]);
+        return Ok(vec![fixed.try_into()?]);
+    }
+
+    // Batch packet
+    if data.len() < 2 {
+        return Ok(vec![]);
+    }
+    let count = data[1] as usize;
+    let mut events = Vec::with_capacity(count);
+    let mut offset = 2;
+
+    for i in 0..count {
+        if offset >= data.len() {
+            log::warn!(
+                "batch truncated: expected {count} events, got {i} (offset={offset}, len={})",
+                data.len()
+            );
+            break;
+        }
+        let len = data[offset] as usize;
+        offset += 1;
+        if offset + len > data.len() {
+            log::warn!(
+                "batch event {i} truncated: need {len} bytes at offset {offset}, have {}",
+                data.len() - offset
+            );
+            break;
+        }
+        let mut fixed = [0u8; MAX_EVENT_SIZE];
+        let copy_len = len.min(MAX_EVENT_SIZE);
+        fixed[..copy_len].copy_from_slice(&data[offset..offset + copy_len]);
+        events.push(fixed.try_into()?);
+        offset += len;
+    }
+
+    Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use input_event::{Event as InputEvent, PointerEvent};
+
+    #[test]
+    fn batch_roundtrip() {
+        let events = vec![
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.5,
+                dy: -2.5,
+            })),
+            ProtoEvent::Ping,
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button {
+                time: 0,
+                button: 0x110,
+                state: 1,
+            })),
+        ];
+
+        let encoded = encode_batch(&events);
+        assert_eq!(encoded[0], BATCH_MAGIC);
+        assert_eq!(encoded[1], 3);
+
+        let decoded = decode_packet(&encoded).unwrap();
+        assert_eq!(decoded.len(), 3);
+    }
+
+    #[test]
+    fn legacy_single_event_decode() {
+        let event = ProtoEvent::Ping;
+        let (buf, _len) = <([u8; MAX_EVENT_SIZE], usize)>::from(event);
+        let decoded = decode_packet(&buf).unwrap();
+        assert_eq!(decoded.len(), 1);
+    }
+}

@@ -1,6 +1,6 @@
 use crate::client::ClientManager;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{MAX_BATCH_SIZE, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -117,6 +117,50 @@ impl LanMouseConnection {
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
         self.recv_rx.recv().await.expect("channel closed")
+    }
+
+    /// Send multiple events as a single batch UDP packet.
+    #[allow(dead_code)]
+    pub(crate) async fn send_batch(
+        &self,
+        events: &[ProtoEvent],
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() == 1 {
+            return self.send(events[0], handle).await;
+        }
+        let buf = lan_mouse_proto::encode_batch(events);
+        self.send_raw(&buf, handle).await
+    }
+
+    async fn send_raw(
+        &self,
+        buf: &[u8],
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            let conn = {
+                let conns = self.conns.lock().await;
+                conns.get(&addr).cloned()
+            };
+            if let Some(conn) = conn {
+                if !self.client_manager.alive(handle) {
+                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
+                }
+                match conn.send(buf).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("client {handle} failed to send: {e}");
+                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Err(LanMouseConnectionError::NotConnected)
     }
 
     pub(crate) async fn send(
@@ -253,9 +297,20 @@ async fn receive_loop(
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        if let Ok(event) = buf.try_into() {
+    let mut buf = [0u8; MAX_BATCH_SIZE];
+    loop {
+        let n = match conn.recv(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        let events = match lan_mouse_proto::decode_packet(&buf[..n]) {
+            Ok(events) => events,
+            Err(e) => {
+                log::warn!("protocol decode error from {addr}: {e}");
+                continue;
+            }
+        };
+        for event in events {
             log::trace!("{addr} <==<==<== {event}");
             match event {
                 ProtoEvent::Pong(b) => {

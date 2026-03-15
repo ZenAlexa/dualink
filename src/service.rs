@@ -118,10 +118,23 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        let coalesce_window = std::time::Duration::from_micros(config.coalesce_window_us());
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            coalesce_window,
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let key_remap = config.key_remap();
-        let emulation = Emulation::new(emulation_backend, listener, key_remap);
+        let mouse_config = input_emulation::MouseConfig {
+            speed: config.mouse_speed(),
+            scroll_speed: config.scroll_speed(),
+            natural_scrolling: config
+                .natural_scrolling()
+                .unwrap_or_else(detect_natural_scrolling),
+        };
+        let emulation = Emulation::new(emulation_backend, listener, key_remap, mouse_config);
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -614,4 +627,29 @@ impl Service {
             }
         });
     }
+}
+
+/// Detect macOS natural scrolling preference.
+/// Falls back to `true` (macOS default) on error.
+#[cfg(target_os = "macos")]
+fn detect_natural_scrolling() -> bool {
+    let output = std::process::Command::new("defaults")
+        .args(["read", "NSGlobalDomain", "com.apple.swipescrolldirection"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let val = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+            log::info!("detected system natural scrolling = {val}");
+            val == "1"
+        }
+        _ => {
+            log::info!("could not detect natural scrolling, defaulting to true");
+            true
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_natural_scrolling() -> bool {
+    false
 }

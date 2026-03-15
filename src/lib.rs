@@ -10,5 +10,6 @@ pub mod diagnostics;
 mod dns;
 mod emulation;
 pub mod emulation_test;
+pub mod event_coalescer;
 mod listen;
 pub mod service;

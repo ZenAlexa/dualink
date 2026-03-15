@@ -56,6 +56,14 @@ struct ConfigToml {
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
     key_remap: Option<HashMap<String, String>>,
+    /// Mouse speed multiplier (default 1.0)
+    mouse_speed: Option<f64>,
+    /// Scroll speed multiplier (default 1.0, negative inverts direction)
+    scroll_speed: Option<f64>,
+    /// Override natural scrolling (None = follow system preference)
+    natural_scrolling: Option<bool>,
+    /// Event coalescing window in microseconds (default 1000 = 1ms, 0 = disabled)
+    coalesce_window_us: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -440,6 +448,35 @@ impl Config {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// mouse speed multiplier (applied to incoming pointer motion events)
+    pub fn mouse_speed(&self) -> f64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.mouse_speed)
+            .unwrap_or(1.0)
+    }
+
+    /// scroll speed multiplier (applied to incoming scroll events)
+    pub fn scroll_speed(&self) -> f64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.scroll_speed)
+            .unwrap_or(1.0)
+    }
+
+    /// natural scrolling override (None = follow macOS system preference)
+    pub fn natural_scrolling(&self) -> Option<bool> {
+        self.config_toml.as_ref().and_then(|c| c.natural_scrolling)
+    }
+
+    /// event coalescing window in microseconds (0 = disabled)
+    pub fn coalesce_window_us(&self) -> u64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.coalesce_window_us)
+            .unwrap_or(1000)
     }
 
     /// release bind for returning control to the host

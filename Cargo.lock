@@ -1950,6 +1950,7 @@ name = "lan-mouse-proto"
 version = "0.2.0"
 dependencies = [
  "input-event",
+ "log",
  "num_enum",
  "paste",
  "thiserror 2.0.12",

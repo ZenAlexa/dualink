@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::event_coalescer::EventCoalescer;
+
 use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
@@ -66,6 +68,7 @@ impl Capture {
         backend: Option<input_capture::Backend>,
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
+        coalesce_window: Duration,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -75,6 +78,7 @@ impl Capture {
             backend,
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
+            coalescer: EventCoalescer::new(coalesce_window),
             conn,
             event_tx,
             request_rx,
@@ -155,6 +159,7 @@ struct CaptureTask {
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    coalescer: EventCoalescer,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -256,10 +261,25 @@ impl CaptureTask {
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
         loop {
+            // Coalesce flush arm: sleeps until the coalescer deadline, or
+            // indefinitely if nothing is buffered.
+            let flush_deadline = self.coalescer.next_deadline();
+
             tokio::select! {
                 event = capture.next() => match event {
                     Some(event) => self.handle_capture_event(capture, event?).await?,
                     None => return Ok(()),
+                },
+                _ = async {
+                    match flush_deadline {
+                        Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if self.flush_coalesced_motion().await {
+                        // Send failed — release capture so the user regains control.
+                        self.release_capture(capture).await?;
+                    }
                 },
                 (handle, event) = self.conn.recv() => {
                     if let Some(active) = self.active_client {
@@ -333,8 +353,10 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // activated a new client
+        // activated a new client — flush any buffered motion for the OLD
+        // client before switching, so deltas don't leak to the new one.
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+            self.flush_coalesced_motion().await;
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -344,24 +366,65 @@ impl CaptureTask {
 
         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
 
-        let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+        match event {
+            CaptureEvent::Begin => {
+                let event = ProtoEvent::Enter(opposite_pos);
+                if let Err(e) = self.conn.send(event, handle).await {
+                    const DUR: Duration = Duration::from_millis(500);
+                    debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                    capture.release().await?;
+                }
+            }
             CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::WaitingForAck => {
+                    let event = ProtoEvent::Enter(opposite_pos);
+                    if let Err(e) = self.conn.send(event, handle).await {
+                        const DUR: Duration = Duration::from_millis(500);
+                        debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                        capture.release().await?;
+                    }
+                }
+                State::Sending => {
+                    // Run through coalescer
+                    let (flushed, passthrough) = self.coalescer.feed(e);
+                    if let Some(motion) = flushed {
+                        if let Err(e) = self.conn.send(ProtoEvent::Input(motion), handle).await {
+                            const DUR: Duration = Duration::from_millis(500);
+                            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                            capture.release().await?;
+                            return Ok(());
+                        }
+                    }
+                    if let Some(ev) = passthrough {
+                        if let Err(e) = self.conn.send(ProtoEvent::Input(ev), handle).await {
+                            const DUR: Duration = Duration::from_millis(500);
+                            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                            capture.release().await?;
+                        }
+                    }
+                }
             },
-        };
-
-        if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            capture.release().await?;
         }
         Ok(())
     }
 
+    /// Flush any motion buffered by the coalescer, sending it to the
+    /// active client (if any).  Returns `true` if a send error occurred.
+    async fn flush_coalesced_motion(&mut self) -> bool {
+        if let Some(motion) = self.coalescer.flush() {
+            if let Some(handle) = self.active_client {
+                if let Err(e) = self.conn.send(ProtoEvent::Input(motion), handle).await {
+                    log::warn!("failed to flush coalesced motion: {e}");
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        // Flush any buffered motion before releasing
+        self.flush_coalesced_motion().await;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             log::info!("sending Leave event to client {handle}");

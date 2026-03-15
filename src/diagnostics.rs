@@ -189,6 +189,28 @@ mod macos {
         }
         println!();
 
+        // --- Mouse & Scroll Preferences ---
+        let mouse_scaling = read_default("com.apple.mouse.scaling");
+        let scroll_scaling = read_default("com.apple.scrollwheel.scaling");
+        let natural_scroll = read_default("com.apple.swipescrolldirection");
+        println!(
+            "  Mouse scaling:      {}",
+            mouse_scaling.as_deref().unwrap_or("default")
+        );
+        println!(
+            "  Scroll scaling:     {}",
+            scroll_scaling.as_deref().unwrap_or("default")
+        );
+        println!(
+            "  Natural scrolling:  {}",
+            match natural_scroll.as_deref() {
+                Some("1") => "enabled",
+                Some("0") => "disabled",
+                _ => "default (enabled)",
+            }
+        );
+        println!();
+
         // --- Network ---
         let port_ok = check_port_available(port);
         println!(
@@ -213,5 +235,20 @@ mod macos {
 
     fn status_str(ok: bool) -> &'static str {
         if ok { "✓ available" } else { "✗ not found" }
+    }
+
+    fn read_default(key: &str) -> Option<String> {
+        Command::new("defaults")
+            .args(["read", "NSGlobalDomain", key])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                } else {
+                    None
+                }
+            })
     }
 }

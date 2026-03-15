@@ -4,9 +4,30 @@ use std::{
     fmt::Display,
 };
 
-use input_event::{Event, KeyboardEvent};
+use input_event::{Event, KeyboardEvent, PointerEvent};
 
 pub use self::error::{EmulationCreationError, EmulationError, InputEmulationError};
+
+/// Runtime mouse and scroll configuration applied before dispatch to backend.
+#[derive(Clone, Debug)]
+pub struct MouseConfig {
+    /// Multiplier for pointer motion deltas (default 1.0).
+    pub speed: f64,
+    /// Multiplier for scroll events (default 1.0).
+    pub scroll_speed: f64,
+    /// Whether to invert scroll direction for natural scrolling.
+    pub natural_scrolling: bool,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            scroll_speed: 1.0,
+            natural_scrolling: false,
+        }
+    }
+}
 
 #[cfg(windows)]
 mod windows;
@@ -81,6 +102,7 @@ pub struct InputEmulation {
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
     key_remap: HashMap<u32, u32>,
+    mouse_config: MouseConfig,
 }
 
 impl InputEmulation {
@@ -107,11 +129,66 @@ impl InputEmulation {
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
             key_remap: HashMap::new(),
+            mouse_config: MouseConfig::default(),
         })
     }
 
     pub fn set_key_remap(&mut self, remap: HashMap<u32, u32>) {
         self.key_remap = remap;
+    }
+
+    pub fn set_mouse_config(&mut self, config: MouseConfig) {
+        log::info!(
+            "mouse config: speed={:.2}, scroll_speed={:.2}, natural_scrolling={}",
+            config.speed,
+            config.scroll_speed,
+            config.natural_scrolling
+        );
+        self.mouse_config = config;
+    }
+
+    fn apply_mouse_config(&self, event: Event) -> Event {
+        match event {
+            Event::Pointer(PointerEvent::Motion { time, dx, dy }) => {
+                Event::Pointer(PointerEvent::Motion {
+                    time,
+                    dx: dx * self.mouse_config.speed,
+                    dy: dy * self.mouse_config.speed,
+                })
+            }
+            Event::Pointer(PointerEvent::Axis { time, axis, value }) => {
+                let dir = if self.mouse_config.natural_scrolling {
+                    -1.0
+                } else {
+                    1.0
+                };
+                Event::Pointer(PointerEvent::Axis {
+                    time,
+                    axis,
+                    value: value * self.mouse_config.scroll_speed * dir,
+                })
+            }
+            Event::Pointer(PointerEvent::AxisDiscrete120 { axis, value }) => {
+                let dir = if self.mouse_config.natural_scrolling {
+                    -1
+                } else {
+                    1
+                };
+                // For discrete scroll, round-to-nearest instead of truncating
+                // to avoid collapsing small values to zero at sub-1.0 speeds.
+                let scaled_f = value as f64 * self.mouse_config.scroll_speed;
+                let scaled = if scaled_f.abs() < 1.0 && scaled_f != 0.0 {
+                    scaled_f.signum() as i32 // preserve at least 1 unit
+                } else {
+                    scaled_f.round() as i32
+                };
+                Event::Pointer(PointerEvent::AxisDiscrete120 {
+                    axis,
+                    value: scaled * dir,
+                })
+            }
+            other => other,
+        }
     }
 
     pub async fn new(backend: Option<Backend>) -> Result<InputEmulation, EmulationCreationError> {
@@ -159,6 +236,9 @@ impl InputEmulation {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError> {
+        // apply mouse speed and scroll normalization
+        let event = self.apply_mouse_config(event);
+
         // apply key remapping for keyboard events
         let event = match event {
             Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
