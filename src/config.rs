@@ -1,5 +1,6 @@
 use crate::capture_test::TestCaptureArgs;
 use crate::emulation_test::TestEmulationArgs;
+use crate::keymap::{KeyRemapConfig, ModifierRole};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -55,7 +56,7 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
-    key_remap: Option<HashMap<String, String>>,
+    key_remap: Option<KeyRemapToml>,
     /// Mouse speed multiplier (default 1.0)
     mouse_speed: Option<f64>,
     /// Scroll speed multiplier (default 1.0, negative inverts direction)
@@ -64,6 +65,14 @@ struct ConfigToml {
     natural_scrolling: Option<bool>,
     /// Event coalescing window in microseconds (default 1000 = 1ms, 0 = disabled)
     coalesce_window_us: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct KeyRemapToml {
+    /// Modifier role remapping: "ctrl" = "cmd", "alt" = "option", etc.
+    modifiers: Option<HashMap<String, String>>,
+    /// Simple key-to-key remapping: "KeyCapsLock" = "KeyEsc", etc.
+    keys: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -431,23 +440,46 @@ impl Config {
             .collect()
     }
 
-    /// key remapping table (e.g. Ctrl→Cmd for Win→Mac workflows)
-    pub fn key_remap(&self) -> HashMap<u32, u32> {
-        self.config_toml
-            .as_ref()
-            .and_then(|c| c.key_remap.as_ref())
-            .map(|map| {
-                map.iter()
-                    .filter_map(|(from, to)| {
-                        let from_key: scancode::Linux =
-                            serde_json::from_value(serde_json::Value::String(from.clone())).ok()?;
-                        let to_key: scancode::Linux =
-                            serde_json::from_value(serde_json::Value::String(to.clone())).ok()?;
-                        Some((from_key as u32, to_key as u32))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+    /// key remapping config (modifier roles + individual keys)
+    pub fn key_remap_config(&self) -> KeyRemapConfig {
+        let remap_toml = match self.config_toml.as_ref().and_then(|c| c.key_remap.as_ref()) {
+            Some(r) => r,
+            None => return KeyRemapConfig::default(),
+        };
+
+        let mut modifier_remap = Vec::new();
+        if let Some(mods) = &remap_toml.modifiers {
+            for (from_str, to_str) in mods {
+                match (
+                    ModifierRole::from_config_str(from_str),
+                    ModifierRole::from_config_str(to_str),
+                ) {
+                    (Some(from), Some(to)) => modifier_remap.push((from, to)),
+                    _ => log::warn!("ignoring invalid modifier remap: {from_str} = {to_str}"),
+                }
+            }
+        }
+
+        let mut key_remap = std::collections::HashMap::new();
+        if let Some(keys) = &remap_toml.keys {
+            for (from_str, to_str) in keys {
+                let from_key: Option<scancode::Linux> =
+                    serde_json::from_value(serde_json::Value::String(from_str.clone())).ok();
+                let to_key: Option<scancode::Linux> =
+                    serde_json::from_value(serde_json::Value::String(to_str.clone())).ok();
+                match (from_key, to_key) {
+                    (Some(from), Some(to)) => {
+                        key_remap.insert(from as u32, to as u32);
+                    }
+                    _ => log::warn!("ignoring invalid key remap: {from_str} = {to_str}"),
+                }
+            }
+        }
+
+        KeyRemapConfig {
+            modifier_remap,
+            key_remap,
+        }
     }
 
     /// mouse speed multiplier (applied to incoming pointer motion events)

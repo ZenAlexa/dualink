@@ -101,7 +101,6 @@ pub struct InputEmulation {
     emulation: Box<dyn Emulation>,
     handles: HashSet<EmulationHandle>,
     pressed_keys: HashMap<EmulationHandle, HashSet<u32>>,
-    key_remap: HashMap<u32, u32>,
     mouse_config: MouseConfig,
 }
 
@@ -128,13 +127,8 @@ impl InputEmulation {
             emulation,
             handles: HashSet::new(),
             pressed_keys: HashMap::new(),
-            key_remap: HashMap::new(),
             mouse_config: MouseConfig::default(),
         })
-    }
-
-    pub fn set_key_remap(&mut self, remap: HashMap<u32, u32>) {
-        self.key_remap = remap;
     }
 
     pub fn set_mouse_config(&mut self, config: MouseConfig) {
@@ -238,19 +232,6 @@ impl InputEmulation {
     ) -> Result<(), EmulationError> {
         // apply mouse speed and scroll normalization
         let event = self.apply_mouse_config(event);
-
-        // apply key remapping for keyboard events
-        let event = match event {
-            Event::Keyboard(KeyboardEvent::Key { time, key, state }) => {
-                let remapped_key = self.key_remap.get(&key).copied().unwrap_or(key);
-                Event::Keyboard(KeyboardEvent::Key {
-                    time,
-                    key: remapped_key,
-                    state,
-                })
-            }
-            other => other,
-        };
 
         match event {
             Event::Keyboard(KeyboardEvent::Key { key, state, .. }) => {

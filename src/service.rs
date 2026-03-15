@@ -126,7 +126,7 @@ impl Service {
             coalesce_window,
         );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let key_remap = config.key_remap();
+        let key_remap = config.key_remap_config();
         let mouse_config = input_emulation::MouseConfig {
             speed: config.mouse_speed(),
             scroll_speed: config.scroll_speed(),

@@ -1,3 +1,4 @@
+use crate::keymap::{KeyRemapConfig, KeyRemapEngine};
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError, MouseConfig};
@@ -65,7 +66,7 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
-        key_remap: std::collections::HashMap<u32, u32>,
+        key_remap: KeyRemapConfig,
         mouse_config: MouseConfig,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend, key_remap, mouse_config);
@@ -220,7 +221,7 @@ enum ProxyRequest {
 impl EmulationProxy {
     fn new(
         backend: Option<input_emulation::Backend>,
-        key_remap: std::collections::HashMap<u32, u32>,
+        key_remap: KeyRemapConfig,
         mouse_config: MouseConfig,
     ) -> Self {
         let (request_tx, request_rx) = channel();
@@ -290,7 +291,7 @@ impl EmulationProxy {
 
 struct EmulationTask {
     backend: Option<input_emulation::Backend>,
-    key_remap: std::collections::HashMap<u32, u32>,
+    key_remap: KeyRemapConfig,
     mouse_config: MouseConfig,
     exit_requested: Rc<Cell<bool>>,
     request_rx: Receiver<ProxyRequest>,
@@ -328,10 +329,13 @@ impl EmulationTask {
             _ = wait_for_termination(&mut self.request_rx) => return Ok(()),
         };
 
-        // apply key remapping configuration
-        if !self.key_remap.is_empty() {
-            log::info!("key remapping active: {} mappings", self.key_remap.len());
-            emulation.set_key_remap(self.key_remap.clone());
+        // create modifier-aware key remap engine
+        let mut key_remap = KeyRemapEngine::new(&self.key_remap);
+        if key_remap.is_active() {
+            log::info!(
+                "key remapping active: {} mappings",
+                self.key_remap.mapping_count()
+            );
         }
 
         // apply mouse and scroll configuration
@@ -350,7 +354,9 @@ impl EmulationTask {
             return Err(e);
         }
 
-        let res = self.do_emulation_session(&mut emulation).await;
+        let res = self
+            .do_emulation_session(&mut emulation, &mut key_remap)
+            .await;
         // FIXME replace with async drop when stabilized
         emulation.terminate().await;
         res
@@ -372,6 +378,7 @@ impl EmulationTask {
     async fn do_emulation_session(
         &mut self,
         emulation: &mut InputEmulation,
+        key_remap: &mut KeyRemapEngine,
     ) -> Result<(), InputEmulationError> {
         loop {
             tokio::select! {
@@ -387,10 +394,17 @@ impl EmulationTask {
                                 handle
                             }
                         };
+                        // Remap BEFORE consume: InputEmulation::pressed_keys
+                        // tracks post-remap scancodes, so release_keys() sends
+                        // the correct remapped keycodes on disconnect.
+                        let event = key_remap.remap_event(event);
                         emulation.consume(event, handle).await?;
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
+                            // Reset is global (not per-client) — safe because
+                            // only one remote keyboard is active at a time.
+                            key_remap.reset();
                             emulation.destroy(handle).await;
                         }
                     }

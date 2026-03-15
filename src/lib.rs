@@ -11,5 +11,6 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 pub mod event_coalescer;
+pub mod keymap;
 mod listen;
 pub mod service;
