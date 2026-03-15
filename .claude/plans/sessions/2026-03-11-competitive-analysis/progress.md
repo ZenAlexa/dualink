@@ -1,0 +1,235 @@
+# Progress Log
+
+## Cross-Reference Ledger
+
+| Phase | Status | Key Outcome |
+|-------|--------|-------------|
+| Competitive Analysis | COMPLETED | findings.md written |
+| Phase 1: Tahoe Resilience | DONE | CGEventTap hardening, accessibility check, diagnostics |
+| Phase 2: Mouse Quality | DONE | Event coalescing, mouse/scroll speed, natural scrolling, batch protocol, diagnostics |
+| Phase 3: Key Remapping | IN PROGRESS | Session 3.1 done: modifier-aware remapping engine |
+| Phase 4: Clipboard | NOT STARTED | — |
+| Phase 5: Polish | NOT STARTED | — |
+
+---
+
+## Session: 2026-03-11 — Competitive Analysis
+
+### What Happened
+1. Cloned 4 reference repos: deskflow, input-leap, barrier, upstream lan-mouse
+2. Ran 5 parallel analysis agents:
+   - dualink deep codebase analysis (8 areas)
+   - deskflow clipboard/mouse/keys/protocol/macOS
+   - input-leap + barrier comparison
+   - dualink vs upstream lan-mouse diff
+   - web research: latency benchmarks, macOS Tahoe changes, VirtualHID, clipboard, DPI
+3. Synthesized findings into gap analysis and prioritized task plan
+
+### Key Discoveries
+- **dualink already has the right transport** (UDP+DTLS) — competitors all use TCP
+- **Mouse quality is the #1 gap** — no coalescing, no acceleration handling, no DPI normalization
+- **macOS Tahoe has breaking changes** — CGEventTap silent disable, CGEventPost partial failure, permission loops
+- **Clipboard is text-only** — competitors support HTML + images, input-leap supports file drag
+- **Key remapping is too basic** — competitors have 3-layer systems with keyboard groups
+- **VirtualHID value confirmed** — critical for Tahoe where CGEventPost is degraded
+- **High poll rate mice (>1000Hz)** are a universal pain point for software KVMs
+
+### Errors
+None.
+
+### Next Session
+Begin Phase 1: macOS Tahoe resilience (Session 1.1: CGEventTap hardening)
+
+---
+
+## Session: 2026-03-11 — Phase 1: Tahoe Resilience
+
+### What Happened
+
+#### Session 1.1: CGEventTap Hardening
+1. **Accessibility check at startup**: Added `AXIsProcessTrusted()` call in `create_event_tap()` before creating the tap. Returns clear `AccessibilityNotTrusted` error with actionable message.
+2. **Auto-re-enable on timeout**: Stored mach port in `Arc<AtomicPtr>` shared with callback. On `TapDisabledByTimeout`, callback calls `CGEventTapEnable(port, true)` to re-enable — matches deskflow's approach (OSXScreen.mm:1661).
+3. **Clean shutdown on user-input disable**: On `TapDisabledByUserInput` (accessibility revoked), sends `EventTapDisabled` notification AND stops the CFRunLoop to trigger proper capture teardown.
+4. **Separated timeout vs user-input handling**: Previously both were treated identically (fatal error). Now timeout is auto-recovered (transient), user-input is fatal (permission revoked).
+
+#### Session 1.2: VirtualHID Backend
+- Backend priority already correct (VirtualHID listed before CGEventPost in `input-emulation/src/lib.rs:138-139`)
+- VirtualHID already checks socket existence + driver activation at construction time
+- Fallback to CGEventPost already logs at warn level
+- No additional changes needed — existing implementation matches the plan
+
+#### Session 1.3: Permission & Diagnostics
+1. **Created `src/diagnostics.rs`** with two entry points:
+   - `log_startup_checks()`: Runs at service start, logs warnings for issues
+   - `print_full_report()`: Full `--diagnose` output to stdout
+2. **Checks implemented**:
+   - macOS version detection via `sw_vers`
+   - Accessibility permission via `AXIsProcessTrusted()`
+   - Secure Input mode via `IsSecureEventInputEnabled()` (Carbon)
+   - VirtualHID daemon socket + driver extension presence
+   - Network port availability (UDP bind test)
+   - macOS Tahoe detection with specific warning
+3. **`--diagnose` CLI flag** added to Args and Config
+4. **Startup diagnostics** called in `run_service()` before creating the service
+
+### Plan Divergences
+- **Session 1.2 was already implemented**: VirtualHID auto-detect, fallback, and health check were already in place from a previous session. No code changes needed.
+- **Periodic TCC monitoring deferred**: The plan called for periodic accessibility permission polling. Instead, we rely on: (a) startup check, (b) `TapDisabledByUserInput` runtime detection. This is simpler and matches deskflow's approach. Can add periodic polling later if needed.
+- **Secure Input PID detection simplified**: Plan referenced deskflow's IORegistry-based PID lookup. Used `IsSecureEventInputEnabled()` boolean check instead — simpler, and the full diagnostic report provides actionable guidance without knowing the exact app.
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓
+- `cargo run --no-default-features -- --diagnose` ✓ (full report verified)
+
+### Cross-Verification Fixes (Codex MCP + GemSuite MCP)
+1. **[FIXED] blocking_lock() before tap disable checks** — Moved TapDisabledByTimeout/UserInput handling BEFORE `client_state.blocking_lock()`. The timeout handler only needs the AtomicPtr, not the mutex. This prevents mutex contention from causing cascading timeouts.
+2. **[FIXED] AccessibilityNotTrusted error lost in auto-selection** — Added `is_permission_error()` method to `CaptureCreationError`. Backend auto-selection now short-circuits on permission errors instead of falling through to `NoAvailableBackend`.
+3. **[FIXED] --diagnose hardcoded DEFAULT_PORT** — `print_full_report()` now takes a `port` parameter from config. Verified: `--port 5000 --diagnose` correctly shows "UDP port 5000".
+4. **[FIXED] Null mach port leaves tap permanently disabled** — Changed fallback from silent log to sending `EventTapDisabled` + stopping CFRunLoop, triggering a full capture restart.
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `input-capture/src/error.rs` | Added `AccessibilityNotTrusted` error variant |
+| `input-capture/src/macos.rs` | CGEventTap hardening: accessibility check, auto-re-enable, clean shutdown |
+| `src/diagnostics.rs` | NEW: startup diagnostics + `--diagnose` report |
+| `src/config.rs` | Added `--diagnose` CLI flag |
+| `src/lib.rs` | Added `pub mod diagnostics` |
+| `src/main.rs` | Handle `--diagnose`, startup checks, cfg-gate GTK imports |
+| `src/clipboard_sync.rs` | Suppressed pre-existing clippy warning |
+| Various | `cargo fmt` formatting fixes |
+
+### Next Session
+Begin Phase 2: Mouse Quality & Latency (Session 2.1: Event coalescing)
+
+---
+
+## Session: 2026-03-11 — Phase 2: Mouse Quality & Latency
+
+### What Happened
+
+#### Session 2.1: Event Coalescing for High-Poll-Rate Mice
+1. **Created `src/event_coalescer.rs`** — standalone module with 6 unit tests
+2. **Accumulates mouse motion deltas** within configurable time window (default 1ms)
+3. **Preserves all non-motion events** (buttons, keys, scroll) — flushes accumulated motion first to maintain ordering
+4. **Configurable via `coalesce_window_us`** in config.toml (0 = disabled)
+5. **Integrated into CaptureTask** select! loop with timer-based flush arm
+6. **Disabled coalescer (window=0)** is a true no-op passthrough
+
+#### Session 2.2: Mouse Speed & DPI Awareness
+1. **Added `mouse_speed` config** (f64, default 1.0) — multiplier applied to all incoming pointer motion events
+2. **Applied at `InputEmulation::consume()` level** — transforms events before dispatch to platform backend, like key_remap
+3. **Reads `com.apple.mouse.scaling` system preference** — displayed in `--diagnose` report for user awareness
+4. **MouseConfig struct** flows through: Config → Service → Emulation → EmulationProxy → EmulationTask → InputEmulation
+
+#### Session 2.3: Network Event Batching
+1. **Added batch encoding/decoding** in `lan-mouse-proto/src/lib.rs`
+2. **Wire format**: `[0xFF magic][count:u8]([len:u8][event_data...])*`
+3. **Backward compatible**: receiver detects batch by 0xFF first byte (no valid EventType uses 0xFF)
+4. **Size-safe**: encode_batch enforces MAX_BATCH_SIZE (1200 bytes, within MTU)
+5. **Receiver upgraded** to MAX_BATCH_SIZE buffer, uses `decode_packet()` for transparent single/batch handling
+6. **`send_batch()` API added** to LanMouseConnection for future batch sending
+
+#### Session 2.4: Scroll Wheel Normalization
+1. **Added `scroll_speed` config** (f64, default 1.0) — multiplier for scroll events
+2. **Natural scrolling support** — `natural_scrolling` config (Option<bool>, None = follow system preference)
+3. **System preference detection** — reads `com.apple.swipescrolldirection` at startup, falls back to macOS default (true)
+4. **Both discrete (line) and continuous (pixel) scroll modes** handled
+5. **AxisDiscrete120 precision** — uses round-to-nearest with minimum 1-unit floor to prevent zero-collapse at sub-1.0 speeds
+6. **Reads `com.apple.scrollwheel.scaling`** — displayed in diagnostics
+
+### Cross-Verification Fixes (Codex MCP)
+1. **[FIXED] P1: Buffered motion sent to wrong client** — Flush coalescer BEFORE updating `active_client` when switching clients on Begin event. Previously, accumulated motion for client A would leak to client B.
+2. **[FIXED] P1: Batch size not enforced** — `encode_batch()` now stops adding events when MAX_BATCH_SIZE would be exceeded, instead of silently exceeding MTU.
+3. **[FIXED] P1: Truncated batch partial decode** — `decode_packet()` now logs warnings on truncated batches instead of silently returning partial results.
+4. **[FIXED] P1: Timer flush ignoring send failures** — `flush_coalesced_motion()` now returns error status; timer arm releases capture on failure instead of leaving it in limbo.
+5. **[FIXED] P2: AxisDiscrete120 scroll precision** — Changed from truncation to round-to-nearest with minimum 1-unit floor, preventing zero-collapse at sub-1.0 scroll speeds.
+
+### Plan Divergences
+- **DPI normalization deferred**: Adding screen resolution to the Enter protocol message requires protocol versioning and both-side changes. The `mouse_speed` config multiplier provides equivalent user-level control. Can add protocol-level DPI negotiation in a future phase.
+- **Network batch sending not yet active**: The batch encode/decode and `send_batch()` API are implemented, but the capture path currently uses the coalescer (which reduces events) + individual sends. The batch infrastructure is ready for integration when needed.
+- **Benchmark not implemented**: Measuring event rates requires a two-machine test setup. The coalescer is ready for benchmarking once the Windows side is available.
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (6 coalescer tests + 2 proto batch tests)
+- `cargo test -p lan-mouse-proto` ✓ (batch_roundtrip + legacy_single_event_decode)
+- `cargo run --no-default-features -- --diagnose` ✓ (mouse/scroll prefs displayed)
+- Codex MCP cross-verification: 4 P1 bugs found and fixed, 1 P2 fixed
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/event_coalescer.rs` | NEW: Motion event coalescing with configurable window and 6 unit tests |
+| `src/lib.rs` | Added `pub mod event_coalescer` |
+| `src/config.rs` | Added mouse_speed, scroll_speed, natural_scrolling, coalesce_window_us config fields |
+| `src/capture.rs` | Integrated EventCoalescer: timer flush arm, coalesced sending, flush-before-switch |
+| `src/connect.rs` | Batch receive (MAX_BATCH_SIZE buffer + decode_packet), send_batch API |
+| `src/service.rs` | Pass MouseConfig and coalesce_window to Emulation and Capture; natural scrolling detection |
+| `src/emulation.rs` | Thread MouseConfig through EmulationProxy → EmulationTask → InputEmulation |
+| `src/diagnostics.rs` | Added mouse scaling, scroll scaling, natural scrolling to diagnostic report |
+| `input-emulation/src/lib.rs` | MouseConfig struct, apply_mouse_config (speed + scroll + natural scrolling), set_mouse_config |
+| `lan-mouse-proto/src/lib.rs` | Batch encode/decode (0xFF magic, size-safe), 2 unit tests |
+| `lan-mouse-proto/Cargo.toml` | Added `log` dependency |
+
+### Next Session
+Begin Phase 3: Key Remapping Overhaul (Session 3.1: Modifier-aware remapping engine)
+
+---
+
+## Session: 2026-03-15 — Phase 3: Session 3.1
+
+### What Happened
+
+#### Session 3.1: Modifier-Aware Remapping Engine
+1. **Created `src/keymap.rs`** — standalone module with `ModifierRole` enum, `KeyRemapConfig`, and `KeyRemapEngine` (9 unit tests)
+2. **Modifier role remapping**: `ModifierRole` maps friendly config names ("ctrl", "cmd", "option", "win") to left/right scancode pairs and XMods bitmasks
+3. **Modifier state tracking**: `pressed_modifiers: HashMap<u32, u32>` records physical→remapped mapping on press, ensures correct release (stickiness)
+4. **Modifier bitmask remapping**: `remap_modifier_bits()` transforms `Modifiers` event `depressed` field — reads original bits, clears source bits, sets destination bits atomically (handles circular swaps correctly)
+5. **New TOML config format**: `[key_remap.modifiers]` for role remapping (e.g., `ctrl = "cmd"`), `[key_remap.keys]` for scancode remapping (e.g., `"KeyCapsLock" = "KeyEsc"`)
+6. **Architectural refactor**: moved key remapping from `input-emulation` library crate to service layer (`EmulationTask` in `src/emulation.rs`), keeping the library backend-agnostic
+7. **Removed old code**: `key_remap: HashMap<u32, u32>` field, `set_key_remap()` method, and inline remap logic removed from `InputEmulation::consume()`
+
+### Plan Divergences
+- **Per-key modifier override deferred**: The task plan mentions "Ctrl+C → Cmd+C but Ctrl+Alt+Del unchanged" exclusion rules. The modifier remapping inherently handles Ctrl+C → Cmd+C (since Ctrl is globally remapped to Cmd). Multi-modifier exclusions would require a more complex rule engine — deferred to Session 3.2 or later if needed.
+- **Config backward compatibility**: The old flat `[key_remap]` format (`"KeyLeftCtrl" = "KeyLeftMeta"`) is silently ignored under the new structured format. This is a breaking change, acceptable for early-stage project.
+
+### Cross-Verification
+- **Code reviewer (sonnet)**: 0 critical, 2 warnings (global reset for single-client assumption — documented with comment; undocumented pressed_keys contract — added comment), 4 suggestions (comments added)
+- **GemSuite (gemini_reason)**: Verified bitmask algorithm across 8 scenarios including circular swaps and chain remaps. Verified stickiness algorithm for config-change and orphaned-release cases. Both algorithms confirmed correct.
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (15 tests: 9 keymap + 6 coalescer)
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/keymap.rs` | NEW: ModifierRole, KeyRemapConfig, KeyRemapEngine with 9 unit tests |
+| `src/lib.rs` | Added `pub mod keymap` |
+| `src/config.rs` | KeyRemapToml struct, changed key_remap field type, new key_remap_config() accessor |
+| `src/service.rs` | Use new config.key_remap_config() accessor |
+| `src/emulation.rs` | KeyRemapConfig/Engine types, remap in do_emulation_session(), reset on Remove |
+| `input-emulation/src/lib.rs` | Removed key_remap field, set_key_remap(), and remap logic from consume() |
+
+### Next Session
+Session 3.2: Runtime Remapping & Hot-Reload (config.toml watching, IPC commands, validation)
