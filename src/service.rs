@@ -16,11 +16,14 @@ use lan_mouse_ipc::{
     IpcError, IpcListenerCreationError, Position, Status,
 };
 use log;
+use notify::{RecursiveMode, Watcher};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::Path,
     sync::{Arc, RwLock},
+    time::Instant,
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify};
@@ -73,6 +76,18 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// config file watcher (kept alive)
+    _config_watcher: Option<notify::RecommendedWatcher>,
+    /// sender kept alive to prevent channel close when watcher absent
+    _config_change_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// receiver for config file change notifications
+    config_change_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    /// debounce timer for config reload
+    last_config_reload: Instant,
+    /// current key remap string state (for IPC GetKeyRemap responses)
+    remap_modifiers: HashMap<String, String>,
+    /// current key remap string state (for IPC GetKeyRemap responses)
+    remap_keys: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -142,6 +157,19 @@ impl Service {
         // clipboard sync
         let clipboard_sync = ClipboardSync::new(config.port());
 
+        // config file watcher for hot-reload
+        let (config_change_tx, config_change_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config_watcher = start_config_watcher(config.config_path(), config_change_tx.clone());
+        if config_watcher.is_some() {
+            log::info!(
+                "watching config file for changes: {:?}",
+                config.config_path()
+            );
+        }
+
+        // initial key remap string state for IPC
+        let (remap_modifiers, remap_keys) = config.key_remap_strings();
+
         let port = config.port();
         let service = Self {
             config,
@@ -161,6 +189,12 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            _config_watcher: config_watcher,
+            _config_change_tx: config_change_tx,
+            config_change_rx,
+            last_config_reload: Instant::now(),
+            remap_modifiers,
+            remap_keys,
         };
         Ok(service)
     }
@@ -188,6 +222,11 @@ impl Service {
                 event = self.clipboard_sync.next_event() => {
                     if let Some(event) = event {
                         self.handle_clipboard_event(event);
+                    }
+                }
+                result = self.config_change_rx.recv() => {
+                    if result.is_some() {
+                        self.handle_config_change();
                     }
                 }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
@@ -257,6 +296,18 @@ impl Service {
                 self.update_enter_hook(handle, enter_hook)
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SetKeyRemap { modifiers, keys } => {
+                self.set_key_remap(modifiers, keys);
+            }
+            FrontendRequest::GetKeyRemap => {
+                self.notify_frontend(FrontendEvent::KeyRemapState {
+                    modifiers: self.remap_modifiers.clone(),
+                    keys: self.remap_keys.clone(),
+                });
+            }
+            FrontendRequest::ResetKeyRemap => {
+                self.set_key_remap(HashMap::new(), HashMap::new());
+            }
         }
     }
 
@@ -279,6 +330,8 @@ impl Service {
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to write config: {e}");
         }
+        // Suppress watcher reload for our own write
+        self.last_config_reload = Instant::now();
     }
 
     async fn handle_frontend_pending(&mut self) {
@@ -589,6 +642,51 @@ impl Service {
         self.notify_frontend(event);
     }
 
+    fn handle_config_change(&mut self) {
+        // Debounce: skip if reloaded within the last 250ms
+        if self.last_config_reload.elapsed() < std::time::Duration::from_millis(250) {
+            return;
+        }
+        self.last_config_reload = Instant::now();
+
+        let (new_config, mod_str, key_str) = self.config.reload_key_remap_from_disk();
+        let warnings = new_config.validate();
+        for w in &warnings {
+            log::warn!("key remap validation: {w}");
+        }
+
+        self.remap_modifiers = mod_str;
+        self.remap_keys = key_str;
+        self.emulation.update_key_remap(new_config);
+        log::info!("key remapping reloaded from config file");
+
+        self.notify_frontend(FrontendEvent::KeyRemapState {
+            modifiers: self.remap_modifiers.clone(),
+            keys: self.remap_keys.clone(),
+        });
+    }
+
+    fn set_key_remap(&mut self, modifiers: HashMap<String, String>, keys: HashMap<String, String>) {
+        let new_config = Config::parse_remap_strings(&modifiers, &keys);
+        let warnings = new_config.validate();
+        for w in &warnings {
+            log::warn!("key remap validation: {w}");
+        }
+
+        // Persist to config_toml so save_config() includes it
+        self.config
+            .set_key_remap_toml(modifiers.clone(), keys.clone());
+        self.remap_modifiers = modifiers;
+        self.remap_keys = keys;
+        self.emulation.update_key_remap(new_config);
+        log::info!("key remapping updated via IPC");
+
+        self.notify_frontend(FrontendEvent::KeyRemapState {
+            modifiers: self.remap_modifiers.clone(),
+            keys: self.remap_keys.clone(),
+        });
+    }
+
     fn handle_clipboard_event(&self, event: ClipboardSyncEvent) {
         match event {
             ClipboardSyncEvent::RemoteChanged { peer, formats } => {
@@ -627,6 +725,48 @@ impl Service {
             }
         });
     }
+}
+
+/// Start a file watcher on the config file's parent directory.
+/// Returns None if the watcher cannot be created (non-fatal).
+fn start_config_watcher(
+    config_path: &Path,
+    tx: tokio::sync::mpsc::UnboundedSender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    let watch_dir = match config_path.parent() {
+        Some(dir) if dir.exists() => dir.to_owned(),
+        _ => {
+            log::info!("config directory does not exist, skipping file watcher");
+            return None;
+        }
+    };
+    let file_name = config_path.file_name()?.to_owned();
+
+    let mut watcher =
+        match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                if event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(&file_name))
+                {
+                    let _ = tx.send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("failed to create config file watcher: {e}");
+                return None;
+            }
+        };
+
+    if let Err(e) = watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
+        log::warn!("failed to watch config directory {:?}: {e}", watch_dir);
+        return None;
+    }
+
+    Some(watcher)
 }
 
 /// Detect macOS natural scrolling preference.

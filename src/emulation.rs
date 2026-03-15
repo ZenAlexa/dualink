@@ -59,6 +59,7 @@ enum EmulationRequest {
     Reenable,
     Release(SocketAddr),
     ChangePort(u16),
+    UpdateKeyRemap(KeyRemapConfig),
     Terminate,
 }
 
@@ -101,6 +102,12 @@ impl Emulation {
     pub(crate) fn request_port_change(&self, port: u16) {
         self.request_tx
             .send(EmulationRequest::ChangePort(port))
+            .expect("channel closed")
+    }
+
+    pub(crate) fn update_key_remap(&self, config: KeyRemapConfig) {
+        self.request_tx
+            .send(EmulationRequest::UpdateKeyRemap(config))
             .expect("channel closed")
     }
 
@@ -180,6 +187,9 @@ impl ListenTask {
                         let result = self.listener.port_changed().await;
                         self.event_tx.send(EmulationEvent::PortChanged(result)).expect("channel closed");
                     }
+                    EmulationRequest::UpdateKeyRemap(config) => {
+                        self.emulation_proxy.update_key_remap(config);
+                    }
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
@@ -214,6 +224,7 @@ pub(crate) struct EmulationProxy {
 enum ProxyRequest {
     Input(Event, SocketAddr),
     Remove(SocketAddr),
+    UpdateKeyRemap(KeyRemapConfig),
     Terminate,
     Reenable,
 }
@@ -280,6 +291,12 @@ impl EmulationProxy {
             .expect("channel closed");
     }
 
+    fn update_key_remap(&self, config: KeyRemapConfig) {
+        self.request_tx
+            .send(ProxyRequest::UpdateKeyRemap(config))
+            .expect("channel closed");
+    }
+
     async fn terminate(&mut self) {
         self.exit_requested.replace(true);
         self.request_tx
@@ -316,6 +333,9 @@ impl EmulationTask {
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::UpdateKeyRemap(config) => {
+                        self.key_remap = config;
+                    }
                 }
             }
         }
@@ -408,6 +428,16 @@ impl EmulationTask {
                             emulation.destroy(handle).await;
                         }
                     }
+                    ProxyRequest::UpdateKeyRemap(new_config) => {
+                        let count = new_config.mapping_count();
+                        self.key_remap = new_config;
+                        *key_remap = KeyRemapEngine::new(&self.key_remap);
+                        if key_remap.is_active() {
+                            log::info!("key remapping updated: {count} mappings");
+                        } else {
+                            log::info!("key remapping cleared");
+                        }
+                    }
                     ProxyRequest::Terminate => break Ok(()),
                     ProxyRequest::Reenable => continue,
                 },
@@ -432,6 +462,7 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
             ProxyRequest::Input(_, _) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
+            ProxyRequest::UpdateKeyRemap(_) => continue,
         }
     }
 }

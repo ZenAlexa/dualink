@@ -217,6 +217,13 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// current key remap state (response to GetKeyRemap, broadcast after SetKeyRemap)
+    KeyRemapState {
+        /// modifier role remapping (e.g., "ctrl" = "cmd")
+        modifiers: HashMap<String, String>,
+        /// key-to-key remapping (e.g., "KeyCapsLock" = "KeyEsc")
+        keys: HashMap<String, String>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -255,6 +262,17 @@ pub enum FrontendRequest {
     UpdateEnterHook(u64, Option<String>),
     /// save config file
     SaveConfiguration,
+    /// set key remapping configuration
+    SetKeyRemap {
+        /// modifier role remapping (e.g., "ctrl" = "cmd")
+        modifiers: HashMap<String, String>,
+        /// key-to-key remapping (e.g., "KeyCapsLock" = "KeyEsc")
+        keys: HashMap<String, String>,
+    },
+    /// query current key remap state
+    GetKeyRemap,
+    /// reset key remapping to defaults
+    ResetKeyRemap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

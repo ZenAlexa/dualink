@@ -120,6 +120,10 @@ struct Args {
     #[arg(long)]
     diagnose: bool,
 
+    /// key remap override (e.g., "ctrl=cmd" or "KeyCapsLock=KeyEsc")
+    #[arg(long = "remap", value_name = "FROM=TO")]
+    remap: Vec<String>,
+
     /// subcommands
     #[command(subcommand)]
     command: Option<Command>,
@@ -440,9 +444,9 @@ impl Config {
             .collect()
     }
 
-    /// key remapping config (modifier roles + individual keys)
-    pub fn key_remap_config(&self) -> KeyRemapConfig {
-        let remap_toml = match self.config_toml.as_ref().and_then(|c| c.key_remap.as_ref()) {
+    /// Parse key remap config from TOML representation.
+    fn parse_key_remap_toml(remap_toml: Option<&KeyRemapToml>) -> KeyRemapConfig {
+        let remap_toml = match remap_toml {
             Some(r) => r,
             None => return KeyRemapConfig::default(),
         };
@@ -479,6 +483,130 @@ impl Config {
         KeyRemapConfig {
             modifier_remap,
             key_remap,
+        }
+    }
+
+    /// Parse a single "FROM=TO" remap override and add to config.
+    fn apply_remap_override(config: &mut KeyRemapConfig, entry: &str) {
+        let parts: Vec<&str> = entry.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            log::warn!("invalid --remap format: {entry} (expected FROM=TO)");
+            return;
+        }
+        let (from_str, to_str) = (parts[0].trim(), parts[1].trim());
+
+        // Try as modifier role first
+        if let (Some(from_role), Some(to_role)) = (
+            ModifierRole::from_config_str(from_str),
+            ModifierRole::from_config_str(to_str),
+        ) {
+            config.modifier_remap.push((from_role, to_role));
+            return;
+        }
+
+        // Try as scancode name
+        let from_key: Option<scancode::Linux> =
+            serde_json::from_value(serde_json::Value::String(from_str.to_string())).ok();
+        let to_key: Option<scancode::Linux> =
+            serde_json::from_value(serde_json::Value::String(to_str.to_string())).ok();
+        match (from_key, to_key) {
+            (Some(from), Some(to)) => {
+                config.key_remap.insert(from as u32, to as u32);
+            }
+            _ => log::warn!("invalid --remap entry: {entry} (unknown key name)"),
+        }
+    }
+
+    /// Parse key remap config from string maps (for IPC SetKeyRemap).
+    pub fn parse_remap_strings(
+        modifiers: &HashMap<String, String>,
+        keys: &HashMap<String, String>,
+    ) -> KeyRemapConfig {
+        let remap_toml = KeyRemapToml {
+            modifiers: if modifiers.is_empty() {
+                None
+            } else {
+                Some(modifiers.clone())
+            },
+            keys: if keys.is_empty() {
+                None
+            } else {
+                Some(keys.clone())
+            },
+        };
+        Self::parse_key_remap_toml(Some(&remap_toml))
+    }
+
+    /// Key remapping config (modifier roles + individual keys).
+    /// Merges config file settings with --remap CLI overrides.
+    pub fn key_remap_config(&self) -> KeyRemapConfig {
+        let mut config = Self::parse_key_remap_toml(
+            self.config_toml.as_ref().and_then(|c| c.key_remap.as_ref()),
+        );
+        for entry in &self.args.remap {
+            Self::apply_remap_override(&mut config, entry);
+        }
+        config
+    }
+
+    /// Re-read config.toml from disk and return updated key remap config.
+    /// CLI --remap overrides are re-applied on top.
+    pub fn reload_key_remap_from_disk(
+        &self,
+    ) -> (
+        KeyRemapConfig,
+        HashMap<String, String>,
+        HashMap<String, String>,
+    ) {
+        let toml = match ConfigToml::new(&self.config_path) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("failed to reload config from {:?}: {e}", self.config_path);
+                return (KeyRemapConfig::default(), HashMap::new(), HashMap::new());
+            }
+        };
+        let remap_toml = toml.key_remap.as_ref();
+        let mut config = Self::parse_key_remap_toml(remap_toml);
+        for entry in &self.args.remap {
+            Self::apply_remap_override(&mut config, entry);
+        }
+        let mut mod_str = remap_toml
+            .and_then(|r| r.modifiers.clone())
+            .unwrap_or_default();
+        let mut key_str = remap_toml.and_then(|r| r.keys.clone()).unwrap_or_default();
+        // Include CLI --remap overrides in string maps for IPC consistency
+        Self::merge_cli_remap_strings(&self.args.remap, &mut mod_str, &mut key_str);
+        (config, mod_str, key_str)
+    }
+
+    /// Get initial key remap string maps (for IPC state tracking).
+    pub fn key_remap_strings(&self) -> (HashMap<String, String>, HashMap<String, String>) {
+        let remap = self.config_toml.as_ref().and_then(|c| c.key_remap.as_ref());
+        let mut mods = remap.and_then(|r| r.modifiers.clone()).unwrap_or_default();
+        let mut keys = remap.and_then(|r| r.keys.clone()).unwrap_or_default();
+        Self::merge_cli_remap_strings(&self.args.remap, &mut mods, &mut keys);
+        (mods, keys)
+    }
+
+    /// Merge --remap CLI entries into string maps so IPC state reflects CLI overrides.
+    fn merge_cli_remap_strings(
+        entries: &[String],
+        modifiers: &mut HashMap<String, String>,
+        keys: &mut HashMap<String, String>,
+    ) {
+        for entry in entries {
+            let parts: Vec<&str> = entry.splitn(2, '=').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let (from, to) = (parts[0].trim(), parts[1].trim());
+            if ModifierRole::from_config_str(from).is_some()
+                && ModifierRole::from_config_str(to).is_some()
+            {
+                modifiers.insert(from.to_string(), to.to_string());
+            } else {
+                keys.insert(from.to_string(), to.to_string());
+            }
         }
     }
 
@@ -543,6 +671,25 @@ impl Config {
             .as_mut()
             .expect("config")
             .authorized_fingerprints = Some(fingerprints);
+    }
+
+    /// Update the key remap section in the in-memory config (for IPC persistence).
+    pub fn set_key_remap_toml(
+        &mut self,
+        modifiers: HashMap<String, String>,
+        keys: HashMap<String, String>,
+    ) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        self.config_toml.as_mut().expect("config").key_remap = Some(KeyRemapToml {
+            modifiers: if modifiers.is_empty() {
+                None
+            } else {
+                Some(modifiers)
+            },
+            keys: if keys.is_empty() { None } else { Some(keys) },
+        });
     }
 
     pub fn write_back(&self) -> Result<(), io::Error> {

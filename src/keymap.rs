@@ -40,6 +40,16 @@ impl ModifierRole {
         }
     }
 
+    /// Convert to canonical config string.
+    pub fn to_config_str(self) -> &'static str {
+        match self {
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Alt => "alt",
+            Self::Meta => "meta",
+        }
+    }
+
     /// Return (left, right) Linux scancodes for this modifier role.
     fn scancodes(self) -> (u32, u32) {
         match self {
@@ -84,6 +94,62 @@ impl KeyRemapConfig {
     /// Total number of active scancode mappings.
     pub fn mapping_count(&self) -> usize {
         self.modifier_remap.len() * 2 + self.key_remap.len()
+    }
+
+    /// Validate the remapping configuration.
+    ///
+    /// Returns a list of warning messages for issues found:
+    /// - Self-remaps (no-ops)
+    /// - Duplicate modifier sources (conflicts)
+    /// - Chains in modifier or key remapping
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        // Check modifier remaps for duplicates and self-maps
+        let mut seen_sources: HashMap<ModifierRole, ModifierRole> = HashMap::new();
+        for &(src, dst) in &self.modifier_remap {
+            if src == dst {
+                warnings.push(format!("modifier remap {:?} -> {:?} is a no-op", src, dst));
+                continue;
+            }
+            if let Some(prev) = seen_sources.insert(src, dst) {
+                if prev != dst {
+                    warnings.push(format!(
+                        "conflicting modifier remap: {:?} mapped to both {:?} and {:?}",
+                        src, prev, dst
+                    ));
+                }
+            }
+        }
+
+        // Check for chains (A->B, B->C where C!=A: not a simple swap)
+        for &(src, dst) in &self.modifier_remap {
+            if src == dst {
+                continue;
+            }
+            if let Some(&next) = seen_sources.get(&dst) {
+                if next != src && next != dst {
+                    warnings.push(format!(
+                        "modifier chain: {:?} -> {:?} -> {:?} (may produce unexpected results)",
+                        src, dst, next
+                    ));
+                }
+            }
+        }
+
+        // Check key remaps for chains
+        for (&src, &dst) in &self.key_remap {
+            if let Some(&next) = self.key_remap.get(&dst) {
+                if next != src {
+                    warnings.push(format!(
+                        "key remap chain: {} -> {} -> {} (may produce unexpected results)",
+                        src, dst, next
+                    ));
+                }
+            }
+        }
+
+        warnings
     }
 }
 
@@ -450,5 +516,95 @@ mod tests {
             state: 1,
         });
         assert_eq!(engine.remap_event(button), button);
+    }
+
+    #[test]
+    fn validate_empty_config_no_warnings() {
+        let config = KeyRemapConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_self_remap_warning() {
+        let config = KeyRemapConfig {
+            modifier_remap: vec![(ModifierRole::Ctrl, ModifierRole::Ctrl)],
+            key_remap: HashMap::new(),
+        };
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no-op"));
+    }
+
+    #[test]
+    fn validate_conflict_warning() {
+        let config = KeyRemapConfig {
+            modifier_remap: vec![
+                (ModifierRole::Ctrl, ModifierRole::Meta),
+                (ModifierRole::Ctrl, ModifierRole::Alt),
+            ],
+            key_remap: HashMap::new(),
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("conflicting")));
+    }
+
+    #[test]
+    fn validate_swap_no_warning() {
+        let config = KeyRemapConfig {
+            modifier_remap: vec![
+                (ModifierRole::Ctrl, ModifierRole::Meta),
+                (ModifierRole::Meta, ModifierRole::Ctrl),
+            ],
+            key_remap: HashMap::new(),
+        };
+        let warnings = config.validate();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn validate_chain_warning() {
+        let config = KeyRemapConfig {
+            modifier_remap: vec![
+                (ModifierRole::Ctrl, ModifierRole::Alt),
+                (ModifierRole::Alt, ModifierRole::Meta),
+            ],
+            key_remap: HashMap::new(),
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("chain")));
+    }
+
+    #[test]
+    fn validate_key_chain_warning() {
+        let a = 10u32;
+        let b = 20u32;
+        let c = 30u32;
+        let config = KeyRemapConfig {
+            modifier_remap: vec![],
+            key_remap: HashMap::from([(a, b), (b, c)]),
+        };
+        let warnings = config.validate();
+        assert!(warnings.iter().any(|w| w.contains("chain")));
+    }
+
+    #[test]
+    fn validate_key_swap_no_warning() {
+        let a = 10u32;
+        let b = 20u32;
+        let config = KeyRemapConfig {
+            modifier_remap: vec![],
+            key_remap: HashMap::from([(a, b), (b, a)]),
+        };
+        let warnings = config.validate();
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn modifier_role_config_str_roundtrip() {
+        for role in ModifierRole::all() {
+            let s = role.to_config_str();
+            let parsed = ModifierRole::from_config_str(s).unwrap();
+            assert_eq!(*role, parsed);
+        }
     }
 }
