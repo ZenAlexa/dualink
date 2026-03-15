@@ -8,7 +8,7 @@
 | Phase 1: Tahoe Resilience | DONE | CGEventTap hardening, accessibility check, diagnostics |
 | Phase 2: Mouse Quality | DONE | Event coalescing, mouse/scroll speed, natural scrolling, batch protocol, diagnostics |
 | Phase 3: Key Remapping | DONE + REVIEWED | Session 3.1: modifier-aware remapping; Session 3.2: hot-reload + IPC; Session 3.3: special key handling; cross-review: 3 fixes applied |
-| Phase 4: Clipboard | NOT STARTED | — |
+| Phase 4: Clipboard | IN PROGRESS | Session 4.1: image clipboard (PNG read/write, base64 protocol, size limit config) |
 | Phase 5: Polish | NOT STARTED | — |
 
 ---
@@ -383,3 +383,62 @@ Phase-level quality gate cross-review of all Phase 3 changes (9c3bc3a..ed38e11, 
 | `src/keymap.rs` | Added `drain_pressed()` method to `KeyRemapEngine` |
 | `src/emulation.rs` | Added `KeyboardEvent` import; UpdateKeyRemap handler drains+releases old pressed state; `wait_for_termination` stores UpdateKeyRemap instead of discarding |
 | `.claude/plans/.../progress.md` | This entry |
+
+---
+
+## Session: 2026-03-15 — Phase 4: Session 4.1
+
+### What Happened
+
+#### Session 4.1: Image Clipboard
+1. **Extended `ClipboardProvider` trait** with `get_image() -> Option<Vec<u8>>`, `set_image(&[u8])`, `has_image() -> bool` — default impls return None/false for platforms without image support.
+2. **macOS image clipboard via osascript**: Reads clipboard as `«class PNGf»` (PNG), falls back to `«class TIFF»` with `sips` conversion to PNG. Validates PNG magic bytes (`\x89PNG`) before returning. Writes PNG to pasteboard via `read file as «class PNGf»`.
+3. **PID-qualified temp file paths**: `/tmp/dualink_cb_{pid}_{suffix}` prevents concurrent access and TOCTOU issues between multiple daemon instances.
+4. **Clipboard sync protocol rewrite**: Split `Data` variant into `TextData` (raw bytes) and `ImageData` (base64-encoded via custom serde module). Base64 reduces JSON overhead from ~300-400% (array of numbers) to ~33%.
+5. **Dynamic buffer allocation**: Replaced fixed 64KB buffer with `vec![0u8; len]` allocated after wire-level size check. Prevents OOM from malicious length prefixes.
+6. **Size limit enforcement**: `max_message_size()` uses `saturating_mul` to prevent overflow. `send_message()` guards against `u32` truncation for messages >4GB.
+7. **Config**: Added `clipboard_max_image_size` to `ConfigToml` (default 50MB) with accessor method. Passed through Service → ClipboardSync.
+8. **Service integration**: `handle_clipboard_event` handles `RemoteImageData` by calling `provider.set_image(&data)`.
+9. **Clipboard polling**: `poll_clipboard` now checks `provider.has_image()` alongside text detection, reporting both formats in `ClipboardNotification::Changed`.
+10. **4 unit tests**: text_data_roundtrip, image_data_base64_roundtrip (validates base64 encoding vs JSON array), max_message_size_scales_with_limit, changed_message_roundtrip.
+
+### Plan Divergences
+- **Wire protocol is not backward-compatible**: `Data` renamed to `TextData`/`ImageData`. Acceptable because the existing clipboard sync protocol was non-functional (broadcast TODO, Request never triggered, RemoteChanged only logged). No deployed peers exist.
+- **No `image` crate dependency**: macOS provides PNG natively via `«class PNGf»` and TIFF→PNG conversion via `sips`. The `image` crate would only be needed for BMP conversion on Windows side (future session).
+- **Double osascript call on clipboard change deferred**: `get_change_count()` and `has_image()` both invoke osascript. This only triggers on clipboard changes (infrequent), not every poll cycle. Optimization deferred to Session 4.4 (clipboard performance).
+
+### Cross-Verification
+- **Code reviewer (sonnet)**: 3 critical, 5 warnings, 3 suggestions found.
+  1. [FIXED] CRITICAL: `u64` overflow in `max_message_size` — added `saturating_mul`
+  2. [FIXED] CRITICAL: `json.len() as u32` truncation in `send_message` — added >4GB guard
+  3. [FIXED] CRITICAL: Hardcoded `/tmp` paths with TOCTOU risk — PID-qualified paths + cleanup on all error paths
+  4. [NOTED] HIGH: Wire protocol backward-incompatible — acceptable, old protocol was non-functional
+  5. [FIXED] WARNING: Silent stdin write error in `set_text` — added `log::warn`
+  6. [REMOVED] WARNING: Redundant post-decode size check — removed (wire_limit check is sufficient)
+  7. [ADDED] SUGGESTION: PNG magic byte validation in `get_image` — validates `\x89PNG` header
+  8. [NOTED] WARNING: Double osascript per change — deferred to Session 4.4
+  9. [NOTED] WARNING: Blocking subprocess in async handler — pre-existing pattern
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (27 tests: 17 keymap + 6 coalescer + 4 clipboard_sync)
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `Cargo.toml` | Added `base64 = "0.22"` dependency |
+| `Cargo.lock` | Updated lockfile for base64 |
+| `src/clipboard/mod.rs` | Extended ClipboardProvider trait with image methods; updated poll_clipboard for image detection |
+| `src/clipboard/macos.rs` | Image clipboard: PNG/TIFF read via osascript, PNG write, sips conversion, PNG validation, PID-qualified temp paths |
+| `src/clipboard_sync.rs` | Protocol: TextData/ImageData split, base64 serde, dynamic buffer, size limits, send_message helper, 4 tests |
+| `src/config.rs` | Added clipboard_max_image_size config field (default 50MB) |
+| `src/service.rs` | Pass max_image_size to ClipboardSync; handle RemoteImageData event |
+
+### Next Session
+Session 4.2: Rich Text / HTML Clipboard
