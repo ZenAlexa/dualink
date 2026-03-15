@@ -27,6 +27,44 @@ use super::error::MacOSEmulationCreationError;
 const VHID_DAEMON_SOCKET_DIR: &str =
     "/Library/Application Support/org.pqrs/tmp/rootonly/vhidd_server";
 
+// HID Usage Page constants
+const HID_USAGE_PAGE_KEYBOARD: u32 = 0x07;
+const HID_USAGE_PAGE_CONSUMER: u32 = 0x0C;
+const HID_USAGE_PAGE_APPLE_VENDOR: u32 = 0xFF01;
+
+// HID Consumer Control Page (0x0C) usage codes
+const HID_CONSUMER_VOLUME_UP: u32 = 0xE9;
+const HID_CONSUMER_VOLUME_DOWN: u32 = 0xEA;
+const HID_CONSUMER_MUTE: u32 = 0xE2;
+const HID_CONSUMER_PLAY_PAUSE: u32 = 0xCD;
+const HID_CONSUMER_SCAN_NEXT_TRACK: u32 = 0xB5;
+const HID_CONSUMER_SCAN_PREVIOUS_TRACK: u32 = 0xB6;
+const HID_CONSUMER_STOP: u32 = 0xB7;
+const HID_CONSUMER_BRIGHTNESS_UP: u32 = 0x006F;
+const HID_CONSUMER_BRIGHTNESS_DOWN: u32 = 0x0070;
+
+// Apple vendor-defined Globe/fn key (page 0xFF01)
+const HID_APPLE_FN_GLOBE: u32 = 0x0003;
+
+// USB HID Keyboard page usage codes for key synthesis
+const HID_KEY_LEFT_GUI: u32 = 0xE3;
+const HID_KEY_LEFT_SHIFT: u32 = 0xE1;
+const HID_KEY_3: u32 = 0x20;
+
+// Linux evdev scancodes for special keys
+const EVDEV_KEY_SYSRQ: u32 = 99;
+const EVDEV_KEY_MUTE: u32 = 113;
+const EVDEV_KEY_VOLUME_DOWN: u32 = 114;
+const EVDEV_KEY_VOLUME_UP: u32 = 115;
+const EVDEV_KEY_MENU: u32 = 139;
+const EVDEV_KEY_NEXTSONG: u32 = 163;
+const EVDEV_KEY_PLAYPAUSE: u32 = 164;
+const EVDEV_KEY_PREVIOUSSONG: u32 = 165;
+const EVDEV_KEY_STOPCD: u32 = 166;
+const EVDEV_KEY_BRIGHTNESS_DOWN: u32 = 224;
+const EVDEV_KEY_BRIGHTNESS_UP: u32 = 225;
+const EVDEV_KEY_FN: u32 = 464;
+
 pub(crate) struct VirtualHIDEmulation {
     /// CGEventSource for mouse events (forwarded via CGEventPost)
     event_source: CGEventSource,
@@ -83,6 +121,11 @@ impl VirtualHIDEmulation {
 
     /// Send a keyboard event through VirtualHID
     fn send_keyboard_event(&mut self, key: u32, state: u8) {
+        // Try special key handling first (media, screenshot, fn/Globe, etc.)
+        if self.try_special_key(key, state) {
+            return;
+        }
+
         if !self.vhid_ready {
             self.vhid_ready = kdk::is_sink_ready();
             if !self.vhid_ready {
@@ -100,11 +143,9 @@ impl VirtualHIDEmulation {
             }
         };
 
-        // DKEvent uses page 0x07 (Keyboard/Keypad) for regular keys
-        // and page 0xFF (vendor-defined) for some special keys
         let mut event = kdk::DKEvent {
             value: if state > 0 { 1 } else { 0 },
-            page: 0x07, // Keyboard/Keypad usage page
+            page: HID_USAGE_PAGE_KEYBOARD,
             code: hid_usage,
         };
 
@@ -112,6 +153,166 @@ impl VirtualHIDEmulation {
         if result != 0 {
             log::warn!("VirtualHID send_key failed: {result}");
         }
+    }
+
+    /// Send a key event on the HID Consumer Control page (media keys, brightness).
+    fn send_consumer_key(&mut self, usage: u32, state: u8) {
+        if !self.ensure_vhid_ready() {
+            return;
+        }
+        let mut event = kdk::DKEvent {
+            value: if state > 0 { 1 } else { 0 },
+            page: HID_USAGE_PAGE_CONSUMER,
+            code: usage,
+        };
+        let result = kdk::send_key(&mut event as *mut kdk::DKEvent);
+        if result != 0 {
+            log::warn!("VirtualHID send_key (consumer) failed: {result}");
+        }
+    }
+
+    /// Send a key event on the Apple vendor-defined page (fn/Globe key).
+    fn send_apple_vendor_key(&mut self, usage: u32, state: u8) {
+        if !self.ensure_vhid_ready() {
+            return;
+        }
+        let mut event = kdk::DKEvent {
+            value: if state > 0 { 1 } else { 0 },
+            page: HID_USAGE_PAGE_APPLE_VENDOR,
+            code: usage,
+        };
+        let result = kdk::send_key(&mut event as *mut kdk::DKEvent);
+        if result != 0 {
+            log::warn!("VirtualHID send_key (apple vendor) failed: {result}");
+        }
+    }
+
+    /// Check and lazily initialize VirtualHID sink readiness.
+    fn ensure_vhid_ready(&mut self) -> bool {
+        if !self.vhid_ready {
+            self.vhid_ready = kdk::is_sink_ready();
+            if !self.vhid_ready {
+                log::warn!("VirtualHID sink not ready, dropping key event");
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Try to handle a special key that the keycode crate cannot map.
+    /// Returns true if the key was handled.
+    fn try_special_key(&mut self, key: u32, state: u8) -> bool {
+        match key {
+            // Volume: HID Consumer Control page
+            EVDEV_KEY_VOLUME_UP => {
+                self.send_consumer_key(HID_CONSUMER_VOLUME_UP, state);
+                true
+            }
+            EVDEV_KEY_VOLUME_DOWN => {
+                self.send_consumer_key(HID_CONSUMER_VOLUME_DOWN, state);
+                true
+            }
+            EVDEV_KEY_MUTE => {
+                self.send_consumer_key(HID_CONSUMER_MUTE, state);
+                true
+            }
+            // Media transport: HID Consumer Control page
+            EVDEV_KEY_PLAYPAUSE => {
+                self.send_consumer_key(HID_CONSUMER_PLAY_PAUSE, state);
+                true
+            }
+            EVDEV_KEY_NEXTSONG => {
+                self.send_consumer_key(HID_CONSUMER_SCAN_NEXT_TRACK, state);
+                true
+            }
+            EVDEV_KEY_PREVIOUSSONG => {
+                self.send_consumer_key(HID_CONSUMER_SCAN_PREVIOUS_TRACK, state);
+                true
+            }
+            EVDEV_KEY_STOPCD => {
+                self.send_consumer_key(HID_CONSUMER_STOP, state);
+                true
+            }
+            // Brightness: HID Consumer Control page
+            EVDEV_KEY_BRIGHTNESS_UP => {
+                self.send_consumer_key(HID_CONSUMER_BRIGHTNESS_UP, state);
+                true
+            }
+            EVDEV_KEY_BRIGHTNESS_DOWN => {
+                self.send_consumer_key(HID_CONSUMER_BRIGHTNESS_DOWN, state);
+                true
+            }
+            // fn/Globe key: Apple vendor page (VirtualHID-only — CGEventPost cannot
+            // synthesize this key; the CGEventPost backend silently drops it)
+            EVDEV_KEY_FN => {
+                self.send_apple_vendor_key(HID_APPLE_FN_GLOBE, state);
+                true
+            }
+            // PrintScreen → macOS screenshot (Cmd+Shift+3) via VirtualHID
+            EVDEV_KEY_SYSRQ => {
+                if state == 1 {
+                    self.synthesize_screenshot();
+                }
+                true
+            }
+            // Context menu → right-click at current cursor position
+            EVDEV_KEY_MENU => {
+                if state == 1 {
+                    self.synthesize_context_menu();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Synthesize Cmd+Shift+3 for macOS screenshot via VirtualHID key events.
+    fn synthesize_screenshot(&mut self) {
+        // Check readiness once before the multi-key sequence to avoid
+        // stuck modifier keys if the sink becomes unavailable mid-sequence.
+        if !self.ensure_vhid_ready() {
+            return;
+        }
+        let send = |code: u32, value: u64| {
+            let mut ev = kdk::DKEvent {
+                value,
+                page: HID_USAGE_PAGE_KEYBOARD,
+                code,
+            };
+            let _ = kdk::send_key(&mut ev as *mut kdk::DKEvent);
+        };
+        send(HID_KEY_LEFT_GUI, 1);
+        send(HID_KEY_LEFT_SHIFT, 1);
+        send(HID_KEY_3, 1);
+        send(HID_KEY_3, 0);
+        send(HID_KEY_LEFT_SHIFT, 0);
+        send(HID_KEY_LEFT_GUI, 0);
+        log::debug!("synthesized screenshot (Cmd+Shift+3) via VirtualHID");
+    }
+
+    /// Synthesize a right-click at current cursor position for context menu.
+    fn synthesize_context_menu(&self) {
+        let Some(location) = self.get_mouse_location() else {
+            log::warn!("could not get mouse location for context menu");
+            return;
+        };
+        if let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::RightMouseDown,
+            location,
+            CGMouseButton::Right,
+        ) {
+            event.post(CGEventTapLocation::HID);
+        }
+        if let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::RightMouseUp,
+            location,
+            CGMouseButton::Right,
+        ) {
+            event.post(CGEventTapLocation::HID);
+        }
+        log::debug!("synthesized context menu (right-click)");
     }
 }
 
@@ -196,8 +397,11 @@ impl Emulation for VirtualHIDEmulation {
                     self.send_keyboard_event(key, state);
                 }
                 KeyboardEvent::Modifiers { .. } => {
-                    // Modifier state is tracked internally by VirtualHID
-                    // through individual key press/release events
+                    // Modifier state is tracked internally by VirtualHID through
+                    // individual key press/release events. CapsLock toggle is
+                    // handled via Key events (evdev 58) in send_keyboard_event.
+                    // We do NOT sync from Modifiers `locked` field to avoid a
+                    // double-toggle race with the Key event path.
                 }
             },
             Event::Pointer(pointer_event) => {

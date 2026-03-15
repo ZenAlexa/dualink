@@ -28,6 +28,44 @@ const DEFAULT_REPEAT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_REPEAT_INTERVAL: Duration = Duration::from_millis(32);
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+// Mac virtual keycodes for special keys
+const KVK_VOLUME_UP: u16 = 0x48;
+const KVK_VOLUME_DOWN: u16 = 0x49;
+const KVK_MUTE: u16 = 0x4A;
+const KVK_ANSI_3: u16 = 0x14;
+
+// NX key type constants for macOS system-defined media events
+const NX_KEYTYPE_PLAY: u32 = 16;
+const NX_KEYTYPE_NEXT: u32 = 17;
+const NX_KEYTYPE_PREVIOUS: u32 = 18;
+const NX_KEYTYPE_BRIGHTNESS_UP: u32 = 2;
+const NX_KEYTYPE_BRIGHTNESS_DOWN: u32 = 3;
+
+// Linux evdev scancodes for special keys
+const EVDEV_KEY_SYSRQ: u32 = 99;
+const EVDEV_KEY_MUTE: u32 = 113;
+const EVDEV_KEY_VOLUME_DOWN: u32 = 114;
+const EVDEV_KEY_VOLUME_UP: u32 = 115;
+const EVDEV_KEY_MENU: u32 = 139;
+const EVDEV_KEY_NEXTSONG: u32 = 163;
+const EVDEV_KEY_PLAYPAUSE: u32 = 164;
+const EVDEV_KEY_PREVIOUSSONG: u32 = 165;
+const EVDEV_KEY_STOPCD: u32 = 166;
+const EVDEV_KEY_BRIGHTNESS_DOWN: u32 = 224;
+const EVDEV_KEY_BRIGHTNESS_UP: u32 = 225;
+
+// Raw CGEvent C API for NX system-defined events and CapsLock detection.
+// The core-graphics Rust crate does not expose NSEventTypeSystemDefined (14)
+// or the undocumented field IDs (131-133) needed for media key injection.
+#[allow(non_snake_case)]
+extern "C" {
+    fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGEventSetType(event: *mut std::ffi::c_void, event_type: u32);
+    fn CGEventSetIntegerValueField(event: *mut std::ffi::c_void, field: u32, value: i64);
+    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
 pub(crate) struct MacOSEmulation {
     /// global event source for all events
     event_source: CGEventSource,
@@ -117,6 +155,127 @@ impl MacOSEmulation {
             let _ = task.await;
         }
     }
+
+    /// Try to handle a special key (media, screenshot, etc.) that the keycode crate cannot map.
+    /// Returns true if the key was handled.
+    fn try_special_key(&self, key: u32, state: u8) -> bool {
+        match key {
+            // Volume keys: have Mac virtual keycodes
+            EVDEV_KEY_VOLUME_UP => {
+                key_event(
+                    self.event_source.clone(),
+                    KVK_VOLUME_UP,
+                    state,
+                    self.modifier_state.get(),
+                );
+                true
+            }
+            EVDEV_KEY_VOLUME_DOWN => {
+                key_event(
+                    self.event_source.clone(),
+                    KVK_VOLUME_DOWN,
+                    state,
+                    self.modifier_state.get(),
+                );
+                true
+            }
+            EVDEV_KEY_MUTE => {
+                key_event(
+                    self.event_source.clone(),
+                    KVK_MUTE,
+                    state,
+                    self.modifier_state.get(),
+                );
+                true
+            }
+            // Media transport: NX system-defined events
+            EVDEV_KEY_PLAYPAUSE => {
+                post_media_key(NX_KEYTYPE_PLAY, state == 1);
+                true
+            }
+            EVDEV_KEY_NEXTSONG => {
+                post_media_key(NX_KEYTYPE_NEXT, state == 1);
+                true
+            }
+            EVDEV_KEY_PREVIOUSSONG => {
+                post_media_key(NX_KEYTYPE_PREVIOUS, state == 1);
+                true
+            }
+            EVDEV_KEY_STOPCD => {
+                // NX keytypes have no dedicated Stop — degrade to play/pause toggle.
+                // VirtualHID backend uses the proper HID_CONSUMER_STOP (0xB7).
+                post_media_key(NX_KEYTYPE_PLAY, state == 1);
+                true
+            }
+            // Brightness: NX system-defined events
+            EVDEV_KEY_BRIGHTNESS_UP => {
+                post_media_key(NX_KEYTYPE_BRIGHTNESS_UP, state == 1);
+                true
+            }
+            EVDEV_KEY_BRIGHTNESS_DOWN => {
+                post_media_key(NX_KEYTYPE_BRIGHTNESS_DOWN, state == 1);
+                true
+            }
+            // PrintScreen → macOS screenshot (Cmd+Shift+3)
+            EVDEV_KEY_SYSRQ => {
+                if state == 1 {
+                    self.synthesize_screenshot();
+                }
+                true
+            }
+            // Context menu → right-click at current cursor position
+            EVDEV_KEY_MENU => {
+                if state == 1 {
+                    self.synthesize_context_menu();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Synthesize Cmd+Shift+3 for macOS screenshot.
+    fn synthesize_screenshot(&self) {
+        let flags = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift;
+        if let Ok(event) =
+            CGEvent::new_keyboard_event(self.event_source.clone(), KVK_ANSI_3 as CGKeyCode, true)
+        {
+            event.set_flags(flags);
+            event.post(CGEventTapLocation::HID);
+        }
+        if let Ok(event) =
+            CGEvent::new_keyboard_event(self.event_source.clone(), KVK_ANSI_3 as CGKeyCode, false)
+        {
+            event.set_flags(flags);
+            event.post(CGEventTapLocation::HID);
+        }
+        log::debug!("synthesized screenshot (Cmd+Shift+3)");
+    }
+
+    /// Synthesize a right-click at current cursor position for context menu.
+    fn synthesize_context_menu(&self) {
+        let Some(location) = self.get_mouse_location() else {
+            log::warn!("could not get mouse location for context menu");
+            return;
+        };
+        if let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::RightMouseDown,
+            location,
+            CGMouseButton::Right,
+        ) {
+            event.post(CGEventTapLocation::HID);
+        }
+        if let Ok(event) = CGEvent::new_mouse_event(
+            self.event_source.clone(),
+            CGEventType::RightMouseUp,
+            location,
+            CGMouseButton::Right,
+        ) {
+            event.post(CGEventTapLocation::HID);
+        }
+        log::debug!("synthesized context menu (right-click)");
+    }
 }
 
 fn key_event(event_source: CGEventSource, key: u16, state: u8, modifiers: XMods) {
@@ -142,6 +301,32 @@ fn modifier_event(event_source: CGEventSource, depressed: XMods) {
     event.set_flags(flags);
     event.post(CGEventTapLocation::HID);
     log::trace!("modifiers updated: {depressed:?}");
+}
+
+/// Post an NX system-defined media key event via raw CGEvent C API.
+/// Used for play/pause, next/prev track, brightness — keys with no Mac virtual keycode.
+fn post_media_key(nx_keytype: u32, key_down: bool) {
+    unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            log::warn!("failed to create CGEvent for media key");
+            return;
+        }
+        // NX_SYSDEFINED = 14 (NSEventTypeSystemDefined)
+        CGEventSetType(event, 14);
+        // Field 131: subtype = 8 (NX_SUBTYPE_AUX_CONTROL_BUTTONS)
+        CGEventSetIntegerValueField(event, 131, 8);
+        // Field 132: data1 = (keyType << 16) | state_flags
+        // 0x0A00 for key down, 0x0B00 for key up
+        let data1: i64 = ((nx_keytype as i64) << 16) | if key_down { 0x0A00 } else { 0x0B00 };
+        CGEventSetIntegerValueField(event, 132, data1);
+        // Field 133: data2 = -1 (unused)
+        CGEventSetIntegerValueField(event, 133, -1);
+        // kCGHIDEventTap = 0
+        CGEventPost(0, event);
+        CFRelease(event as *const std::ffi::c_void);
+    }
+    log::trace!("media key: nx_keytype={nx_keytype} down={key_down}");
 }
 
 fn get_display_at_point(x: CGFloat, y: CGFloat) -> Option<CGDirectDisplayID> {
@@ -414,10 +599,14 @@ impl Emulation for MacOSEmulation {
                     key,
                     state,
                 } => {
+                    // Try special key handling first (media, screenshot, etc.)
+                    if self.try_special_key(key, state) {
+                        return Ok(());
+                    }
                     let code = match KeyMap::from_key_mapping(KeyMapping::Evdev(key as u16)) {
                         Ok(k) => k.mac as CGKeyCode,
                         Err(_) => {
-                            log::warn!("unable to map key event");
+                            log::warn!("unable to map key event: evdev {key}");
                             return Ok(());
                         }
                     };
@@ -437,6 +626,11 @@ impl Emulation for MacOSEmulation {
                     locked,
                     group,
                 } => {
+                    // CapsLock toggle is handled via Key events (evdev 58 → Mac 0x39)
+                    // through the normal keycode mapping path. We intentionally do NOT
+                    // sync from the Modifiers `locked` field here to avoid a double-toggle
+                    // race: Key arrives first and toggles, then Modifiers arrives before
+                    // CGEventSourceFlagsState updates, triggering a second toggle (net zero).
                     set_modifiers(&self.modifier_state, depressed, latched, locked, group);
                     modifier_event(self.event_source.clone(), self.modifier_state.get());
                 }
