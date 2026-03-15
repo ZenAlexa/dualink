@@ -7,7 +7,7 @@
 | Competitive Analysis | COMPLETED | findings.md written |
 | Phase 1: Tahoe Resilience | DONE | CGEventTap hardening, accessibility check, diagnostics |
 | Phase 2: Mouse Quality | DONE | Event coalescing, mouse/scroll speed, natural scrolling, batch protocol, diagnostics |
-| Phase 3: Key Remapping | IN PROGRESS | Session 3.1 done: modifier-aware remapping engine; Session 3.2 done: runtime hot-reload + IPC |
+| Phase 3: Key Remapping | DONE | Session 3.1: modifier-aware remapping; Session 3.2: hot-reload + IPC; Session 3.3: special key handling |
 | Phase 4: Clipboard | NOT STARTED | — |
 | Phase 5: Polish | NOT STARTED | — |
 
@@ -281,3 +281,51 @@ None.
 
 ### Next Session
 Session 3.3: Special Key Handling (fn/Globe, media keys, PrintScreen, CapsLock sync)
+
+---
+
+## Session: 2026-03-15 — Phase 3: Session 3.3
+
+### What Happened
+
+#### Session 3.3: Special Key Handling
+1. **CGEventPost media keys**: Volume Up/Down/Mute via Mac virtual keycodes (0x48/0x49/0x4A) using standard `CGEvent::new_keyboard_event()`. Play/Pause, Next/Previous, Brightness Up/Down via NX system-defined events using raw CGEvent C API — `CGEventCreate` + `CGEventSetType(14)` + fields 131-133 for subtype/data1/data2.
+2. **VirtualHID media keys**: All media keys via USB HID Consumer Control page (0x0C) with proper usage codes: Volume (0xE9/0xEA/0xE2), Play/Pause (0xCD), Next/Prev (0xB5/0xB6), Stop (0xB7), Brightness (0x006F/0x0070).
+3. **fn/Globe key**: VirtualHID-only via Apple vendor page (0xFF01, usage 0x0003). CGEventPost cannot synthesize this — event is silently dropped if no VirtualHID backend.
+4. **PrintScreen → Screenshot**: CGEventPost synthesizes Cmd+Shift+3 with modifier flags on `CGEvent::new_keyboard_event`. VirtualHID synthesizes full key sequence (GUI↓, Shift↓, 3↓, 3↑, Shift↑, GUI↑) with atomic readiness check.
+5. **Context menu key**: Both backends synthesize right-click at current cursor position via `CGEvent::new_mouse_event(RightMouseDown/Up)`.
+6. **CapsLock toggle**: Handled via normal Key event path (evdev 58 → keycode crate → Mac 0x39). Modifiers-based sync intentionally omitted to prevent double-toggle race.
+
+### Plan Divergences
+- **CapsLock Modifiers sync removed**: The task plan said "Handle CapsLock toggle state sync between machines." Initial implementation added sync from `Modifiers { locked }` events. Code review identified a critical double-toggle race: Key event toggles CapsLock, then Modifiers event arrives before `CGEventSourceFlagsState` updates, triggering a second toggle (net zero). Removed Modifiers-based sync — CapsLock key events handle the toggle correctly through the normal keycode mapping path.
+- **Brightness NX_KEYTYPE values corrected**: Initially used 22/23 (keyboard illumination), code review caught this — correct values are 2/3 per Apple's `ev_keymap.h`.
+- **No new files created**: All changes in existing backend files as specified by task plan.
+
+### Cross-Verification
+- **Code reviewer (sonnet)**: 2 critical, 5 warnings, 4 suggestions found.
+  1. [FIXED] CRITICAL: Wrong NX_KEYTYPE brightness values (22/23 → 2/3)
+  2. [FIXED] CRITICAL: CapsLock double-toggle from Key + Modifiers paths — removed Modifiers sync
+  3. [FIXED] WARNING: VirtualHID screenshot partial sequence risk — check ready once before sequence
+  4. [FIXED] WARNING: `send_vhid_key` unused after screenshot refactor — removed
+  5. [NOTED] WARNING: EVDEV_KEY_STOPCD handled differently between backends — added comment
+  6. [NOTED] WARNING: Context menu doesn't update click-state tracking — edge case, deferred
+  7. [NOTED] WARNING: Undocumented NX event fields 131-133 — comment in code, no public API alternative
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (23 tests: 17 keymap + 6 coalescer)
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `input-emulation/src/macos.rs` | Added special key handling: NX media key injection via raw CGEvent C API, volume via Mac keycodes, PrintScreen synthesis, context menu right-click, evdev scancode constants |
+| `input-emulation/src/macos_vhid.rs` | Added special key handling: Consumer Control page (0x0C) for media keys, Apple vendor page (0xFF01) for fn/Globe, PrintScreen synthesis via key sequence, context menu right-click, HID usage constants |
+
+### Next Session
+Begin Phase 4: Clipboard Enhancement (Session 4.1: Image Clipboard)
