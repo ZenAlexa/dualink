@@ -155,7 +155,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         // clipboard sync
-        let clipboard_sync = ClipboardSync::new(config.port());
+        let clipboard_sync = ClipboardSync::new(config.port(), config.clipboard_max_image_size());
 
         // config file watcher for hot-reload
         let (config_change_tx, config_change_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -696,6 +696,11 @@ impl Service {
                 log::info!("setting clipboard from remote: {} bytes", text.len());
                 let provider = crate::clipboard::platform_clipboard();
                 provider.set_text(&text);
+            }
+            ClipboardSyncEvent::RemoteImageData { data } => {
+                log::info!("setting clipboard image from remote: {} bytes", data.len());
+                let provider = crate::clipboard::platform_clipboard();
+                provider.set_image(&data);
             }
         }
     }

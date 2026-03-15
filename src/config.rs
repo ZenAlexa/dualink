@@ -65,6 +65,8 @@ struct ConfigToml {
     natural_scrolling: Option<bool>,
     /// Event coalescing window in microseconds (default 1000 = 1ms, 0 = disabled)
     coalesce_window_us: Option<u64>,
+    /// Maximum image size for clipboard sync in bytes (default 50MB)
+    clipboard_max_image_size: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -637,6 +639,14 @@ impl Config {
             .as_ref()
             .and_then(|c| c.coalesce_window_us)
             .unwrap_or(1000)
+    }
+
+    /// maximum image size for clipboard sync in bytes (default 50MB)
+    pub fn clipboard_max_image_size(&self) -> u64 {
+        self.config_toml
+            .as_ref()
+            .and_then(|c| c.clipboard_max_image_size)
+            .unwrap_or(50 * 1024 * 1024)
     }
 
     /// release bind for returning control to the host

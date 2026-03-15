@@ -22,6 +22,17 @@ pub trait ClipboardProvider: Send + 'static {
     fn get_text(&self) -> Option<String>;
     fn set_text(&self, text: &str);
     fn get_change_count(&self) -> u64;
+
+    /// Get image data from clipboard as PNG bytes
+    fn get_image(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Set clipboard image from PNG bytes
+    fn set_image(&self, _data: &[u8]) {}
+    /// Check if clipboard contains an image (without reading it)
+    fn has_image(&self) -> bool {
+        false
+    }
 }
 
 /// Clipboard watcher that polls for changes
@@ -75,6 +86,9 @@ async fn poll_clipboard<P: ClipboardProvider>(
             if let Some(text) = provider.get_text() {
                 size_hint = text.len() as u64;
                 formats.push(ClipboardFormat::Text);
+            }
+            if provider.has_image() {
+                formats.push(ClipboardFormat::Image);
             }
             if !formats.is_empty() {
                 let _ = tx
