@@ -7,7 +7,7 @@
 | Competitive Analysis | COMPLETED | findings.md written |
 | Phase 1: Tahoe Resilience | DONE | CGEventTap hardening, accessibility check, diagnostics |
 | Phase 2: Mouse Quality | DONE | Event coalescing, mouse/scroll speed, natural scrolling, batch protocol, diagnostics |
-| Phase 3: Key Remapping | IN PROGRESS | Session 3.1 done: modifier-aware remapping engine |
+| Phase 3: Key Remapping | IN PROGRESS | Session 3.1 done: modifier-aware remapping engine; Session 3.2 done: runtime hot-reload + IPC |
 | Phase 4: Clipboard | NOT STARTED | — |
 | Phase 5: Polish | NOT STARTED | — |
 
@@ -233,3 +233,51 @@ None.
 
 ### Next Session
 Session 3.2: Runtime Remapping & Hot-Reload (config.toml watching, IPC commands, validation)
+
+---
+
+## Session: 2026-03-15 — Phase 3: Session 3.2
+
+### What Happened
+
+#### Session 3.2: Runtime Remapping & Hot-Reload
+1. **Config file watcher** using `notify` crate (v7, FSEvents on macOS): watches config directory, filters for config.toml changes, bridges to tokio via `tokio::sync::mpsc::unbounded_channel`. 250ms leading-edge debounce prevents rapid reloads. Self-write suppression prevents watcher from reverting IPC-set remaps after `save_config()`.
+2. **Hot-reload key remapping**: `handle_config_change()` in Service re-reads config.toml, validates, and pushes updated `KeyRemapConfig` through `Emulation::update_key_remap()` → `EmulationRequest` → `ProxyRequest` → live `KeyRemapEngine` rebuild in `do_emulation_session()`. No restart needed.
+3. **IPC commands**: Added `SetKeyRemap { modifiers, keys }`, `GetKeyRemap`, `ResetKeyRemap` to `FrontendRequest`; `KeyRemapState { modifiers, keys }` to `FrontendEvent`. String-based HashMap format matching TOML config. `SetKeyRemap` persists to `config_toml.key_remap` so `save_config()` includes changes.
+4. **`--remap` CLI flag**: `--remap ctrl=cmd --remap KeyCapsLock=KeyEsc` — supports both modifier roles and scancode names. Applied on top of config file, re-applied on hot-reload. CLI overrides reflected in IPC `GetKeyRemap` responses via `merge_cli_remap_strings()`.
+5. **Validation**: `KeyRemapConfig::validate()` detects self-remaps (no-ops), duplicate modifier sources (conflicts), chains in both modifier and key remapping. Warnings logged on load; valid configs still applied.
+6. **Emulation update channel**: `UpdateKeyRemap(KeyRemapConfig)` added to `EmulationRequest`, `ProxyRequest`. Handled in all code paths: active session (live engine rebuild), inactive wait loop (stored for next `do_emulation()` cycle), and termination wait (ignored).
+
+### Plan Divergences
+- **No trailing-edge debounce**: Used leading-edge debounce with self-write suppression instead of a trailing timer. Simpler, and macOS FSEvents coalesces events well enough. Could add trailing retry if partial-file reads become an issue with specific editors.
+- **IPC key remap uses string maps, not KeyRemapConfig directly**: `lan-mouse-ipc` crate doesn't depend on binary crate types. Used `HashMap<String, String>` format matching TOML config for both modifiers and keys.
+
+### Cross-Verification
+- **Code reviewer (sonnet)**: 0 critical, 3 warnings, 4 suggestions. All 3 warnings fixed:
+  1. [FIXED] IPC-set remaps not persisted to config_toml — added `set_key_remap_toml()` and called from `set_key_remap()`
+  2. [FIXED] Watcher save-loop reverting IPC changes — `save_config()` now sets `last_config_reload = Instant::now()` to suppress watcher
+  3. [FIXED] CLI overrides not in IPC state — `merge_cli_remap_strings()` includes `--remap` entries in IPC responses
+
+### Verification
+- `cargo build --no-default-features` ✓
+- `cargo build --no-default-features --features macos_vhid` ✓
+- `cargo fmt --check` ✓
+- `cargo clippy --no-default-features -- -D warnings` ✓
+- `cargo test --no-default-features` ✓ (23 tests: 17 keymap + 6 coalescer)
+
+### Errors
+None.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `Cargo.toml` | Added `notify = "7"` dependency |
+| `Cargo.lock` | Updated lockfile for notify + transitive deps |
+| `lan-mouse-ipc/src/lib.rs` | Added SetKeyRemap, GetKeyRemap, ResetKeyRemap requests + KeyRemapState event |
+| `src/keymap.rs` | Added `ModifierRole::to_config_str()`, `KeyRemapConfig::validate()`, 8 new tests |
+| `src/config.rs` | Added `--remap` CLI flag, `parse_key_remap_toml()`, `apply_remap_override()`, `parse_remap_strings()`, `reload_key_remap_from_disk()`, `key_remap_strings()`, `set_key_remap_toml()`, `merge_cli_remap_strings()` |
+| `src/emulation.rs` | Added `UpdateKeyRemap` to EmulationRequest/ProxyRequest, `update_key_remap()` on Emulation/EmulationProxy, handlers in ListenTask, EmulationTask, wait loops |
+| `src/service.rs` | Added notify file watcher, config_change channel, debounce, `handle_config_change()`, `set_key_remap()`, IPC handlers, self-write suppression in `save_config()` |
+
+### Next Session
+Session 3.3: Special Key Handling (fn/Globe, media keys, PrintScreen, CapsLock sync)
